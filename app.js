@@ -190,7 +190,7 @@ const WORLDS = [
 /* =========================================================
    State
    ========================================================= */
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.0.1';
 const defaultProfile = () => ({ dailyGoal: 1000, days: {}, last: null, edSize: 'm', lastBackup: null, installHidden: false });
 const S = {
   mode: 'connecting',   // device (IndexedDB) | local (localStorage) | memory
@@ -422,6 +422,27 @@ function makeDeviceStore(db) {
     saveEngine: (nid, e) => put('board:' + nid, e),
     deleteEngine: (nid) => del('board:' + nid),
     clearAll: () => run('readwrite', (s) => s.clear()),
+    // Swap in a whole snapshot in one transaction: if any write fails, nothing changes.
+    // "meta:" keys (AI key, sync state) are device-only and stay as they are.
+    replaceAll: (snap) => new Promise((resolve, reject) => {
+      const t = db.transaction(DB_STORE, 'readwrite');
+      t.oncomplete = () => resolve();
+      t.onerror = () => reject(t.error);
+      t.onabort = () => reject(t.error || new Error('aborted'));
+      try {
+        const s = t.objectStore(DB_STORE);
+        s.delete('profile');
+        ['novel:', 'chapter:', 'board:'].forEach((p) => s.delete(range(p)));
+        s.put(snap.profile, 'profile');
+        for (const n of snap.novels) {
+          s.put(n, 'novel:' + n.id);
+          for (const c of snap.chapters[n.id] || []) s.put(c, 'chapter:' + n.id + ':' + c.id);
+          if (snap.boards[n.id]) s.put(snap.boards[n.id], 'board:' + n.id);
+        }
+      } catch (e) { try { t.abort(); } catch (_) {} reject(e); }
+    }),
+    getMeta: (k) => get('meta:' + k),
+    saveMeta: (k, v) => put('meta:' + k, v),
   };
 }
 
@@ -433,6 +454,7 @@ const LocalStore = {
     try { this.data = raw ? JSON.parse(raw) : null; } catch (e) { this.data = null; }
     if (!this.data || typeof this.data !== 'object') this.data = { profile: null, novels: {}, chapters: {}, engines: {} };
     if (!this.data.engines || typeof this.data.engines !== 'object') this.data.engines = {};
+    if (!this.data.meta || typeof this.data.meta !== 'object') this.data.meta = {};
   },
   persist() { clearTimeout(this.t); this.t = setTimeout(() => this.persistNow(), 300); },
   persistNow() {
@@ -452,7 +474,22 @@ const LocalStore = {
   async getEngine(nid) { const e = this.data.engines[nid]; return e ? clone(e) : null; },
   async saveEngine(nid, e) { this.data.engines[nid] = e; this.persist(); },
   async deleteEngine(nid) { delete this.data.engines[nid]; this.persist(); },
-  async clearAll() { this.data = { profile: null, novels: {}, chapters: {}, engines: {} }; this.persistNow(); },
+  async clearAll() { this.data = { profile: null, novels: {}, chapters: {}, engines: {}, meta: this.data.meta || {} }; this.persistNow(); },
+  async replaceAll(snap) {
+    const old = this.data;
+    const next = { profile: snap.profile, novels: {}, chapters: {}, engines: {}, meta: old.meta || {} };
+    for (const n of snap.novels) {
+      next.novels[n.id] = n;
+      next.chapters[n.id] = {};
+      for (const c of snap.chapters[n.id] || []) next.chapters[n.id][c.id] = c;
+      if (snap.boards[n.id]) next.engines[n.id] = snap.boards[n.id];
+    }
+    this.data = next;
+    this.persistNow();
+    if (!this.ok) { this.data = old; this.persistNow(); throw new Error('Couldn’t save the restored data'); }
+  },
+  async getMeta(k) { const v = this.data.meta && this.data.meta[k]; return v === undefined ? undefined : clone(v); },
+  async saveMeta(k, v) { (this.data.meta = this.data.meta || {})[k] = v; this.persist(); },
 };
 
 /* ---- debounced saves ---- */
@@ -501,13 +538,14 @@ function paintSave() {
   $$('.save-state').forEach((el) => { el.textContent = t; el.dataset.state = c; });
 }
 
+const chNum = (v) => { const k = Math.floor(Number(v)); return k > 0 ? k : 0; };
 const chLoads = new Map();
 function ensureChapters(nid) {
   if (S.chapters.has(nid)) return Promise.resolve(S.chapters.get(nid));
   if (!S.store) return Promise.resolve(null);
   if (!chLoads.has(nid)) {
     chLoads.set(nid, S.store.listChapters(nid).then((list) => {
-      const m = new Map(); list.forEach((c) => m.set(c.id, c)); S.chapters.set(nid, m); return m;
+      const m = new Map(); list.forEach((c) => { c.n = chNum(c.n); m.set(c.id, c); }); S.chapters.set(nid, m); return m;
     }).catch(() => { chLoads.delete(nid); toast('Couldn’t load chapters. Check your connection and open the novel again.'); return null; }));
   }
   return chLoads.get(nid);
@@ -684,7 +722,7 @@ function chaptersHTML(n, m, chs) {
   if (!chs.length) return head + `<div class="empty"><p>No chapters yet.</p><button class="btn btn-accent" data-act="new-chapter">Start chapter 1</button></div>`;
   return head + `<ol class="chapters">${chs.map((c) => `
     <li><button class="ch-row" data-act="open-chapter" data-nid="${esc(n.id)}" data-cid="${esc(c.id)}">
-      <span class="ch-num">${c.n}</span>
+      <span class="ch-num">${esc(c.n)}</span>
       <span class="ch-main">
         <span class="ch-title ${c.title ? '' : 'untitled'}">${esc(c.title || 'Untitled chapter')}</span>
         <span class="ch-meta">${fmt(c.words)} words · ${esc(ago(c.updatedAt))}${(c.outline || []).length ? ` · outline ${c.outline.filter((b) => b.done).length}/${c.outline.length}` : ''}</span>
@@ -729,8 +767,8 @@ function renderEditor() {
     <div class="ed-progress" id="ed-progress" aria-hidden="true"><span id="ed-bar"></span></div>
     <div id="ol-slot">${outlineBarHTML(ch)}</div>
     <div class="ed-body">
-      <input id="ed-title" class="ed-title" placeholder="Chapter ${ch.n} title" aria-label="Chapter title" autocomplete="off">
-      <textarea id="ed-text" class="ed-text" placeholder="${(ch.outline || []).length ? `Write chapter ${ch.n} from its outline. Tap Outline above to see the beats.` : `Start chapter ${ch.n} here…`}" aria-label="Chapter text" spellcheck="true"></textarea>
+      <input id="ed-title" class="ed-title" placeholder="Chapter ${esc(ch.n)} title" aria-label="Chapter title" autocomplete="off">
+      <textarea id="ed-text" class="ed-text" placeholder="${(ch.outline || []).length ? `Write chapter ${esc(ch.n)} from its outline. Tap Outline above to see the beats.` : `Start chapter ${esc(ch.n)} here…`}" aria-label="Chapter text" spellcheck="true"></textarea>
     </div>`;
   const ta = $('#ed-text'), ti = $('#ed-title');
   ta.value = ch.text || '';
@@ -1039,7 +1077,7 @@ function editorMenu() {
   const ch = curChapter(); if (!ch) return;
   const size = S.profile.edSize || 'm';
   openSheet(`
-    <div class="sheet-head"><h3>Chapter ${ch.n}</h3>${closeBtn}</div>
+    <div class="sheet-head"><h3>Chapter ${esc(ch.n)}</h3>${closeBtn}</div>
     <div class="form">
       <div class="field"><span class="field-label">Status</span><div class="seg">${Object.entries(STATUS).map(([k, l]) => `<button aria-pressed="${ch.status === k}" data-act="ed-status" data-v="${k}">${l}</button>`).join('')}</div></div>
       <div class="field"><span class="field-label">Text size</span><div class="seg">${[['s', 'Small'], ['m', 'Medium'], ['l', 'Large']].map(([k, l]) => `<button aria-pressed="${size === k}" data-act="ed-size" data-v="${k}">${l}</button>`).join('')}</div></div>
@@ -1548,7 +1586,7 @@ function outlineText(ch) {
 function outlineSheet() {
   const ch = curChapter(); if (!ch || !(ch.outline || []).length) return;
   openSheet(`
-    <div class="sheet-head"><span class="sheet-ic">${icon('recap')}</span><h3>Chapter ${ch.n} outline</h3>${closeBtn}</div>
+    <div class="sheet-head"><span class="sheet-ic">${icon('recap')}</span><h3>Chapter ${esc(ch.n)} outline</h3>${closeBtn}</div>
     <p class="sheet-sub">Beats from Plotfeed, in order. Tick each one off once it’s written.</p>
     <ol class="ol-list">${ch.outline.map((b, i) => `<li>
       <button class="beat-row" aria-pressed="${!!b.done}" data-act="ol-done" data-i="${i}"><span class="beat-box" aria-hidden="true"></span><span class="beat-txt"><b>${esc(b.who)}</b>${b.kind === 'move' ? ` ${b.mode === 'say' ? 'says' : 'does'}` : ''}: ${esc(b.text)}</span></button>
@@ -1675,10 +1713,10 @@ function onRestoreFile(e) {
   r.onload = () => {
     let d = null;
     try { d = JSON.parse(String(r.result || '')); } catch (err) { d = null; }
-    const ok = d && d.app === 'serialist' && Array.isArray(d.novels) && d.chapters && typeof d.chapters === 'object' && d.novels.every((n) => n && typeof n.id === 'string');
+    const snap = checkBackup(d);
     const slot = $('#confirm-slot'); if (!slot) return;
-    if (!ok) { slot.innerHTML = `<div class="confirm"><p>That file isn’t a Serialist backup. Pick a file named like serialist-backup-2026-09-28.json.</p></div>`; return; }
-    S.restoreData = d;
+    if (!snap) { slot.innerHTML = `<div class="confirm"><p>That file isn’t a Serialist backup, or it’s damaged. Pick a file named like serialist-backup-2026-09-28.json.</p></div>`; return; }
+    S.restoreData = snap;
     const when = d.exportedAt ? new Date(d.exportedAt).toLocaleString() : 'an unknown date';
     slot.innerHTML = `<div class="confirm"><p>Replace everything in Serialist with the backup from <strong>${esc(when)}</strong>? It has ${fmt(d.novels.length)} ${d.novels.length === 1 ? 'novel' : 'novels'}. What’s in the app now will be removed.</p><div class="row"><button class="btn btn-danger sm" data-act="bk-restore-go">Replace with backup</button><button class="btn btn-ghost sm" data-act="close-sheet">Keep what I have</button></div></div>`;
   };
@@ -1690,22 +1728,51 @@ async function restoreBackup() {
   for (const [, t] of timers) clearTimeout(t.id);
   timers.clear();
   try {
-    await S.store.clearAll();
-    await S.store.saveProfile(Object.assign(defaultProfile(), d.profile || {}));
-    for (const n of d.novels) {
-      await S.store.saveNovel(n);
-      for (const c of (Array.isArray(d.chapters[n.id]) ? d.chapters[n.id] : [])) await S.store.saveChapter(n.id, c);
-      if (d.boards && d.boards[n.id]) await S.store.saveEngine(n.id, d.boards[n.id]);
-    }
-    if (S.store === LocalStore) LocalStore.persistNow();
+    await S.store.replaceAll(d);
     S.restoreData = null;
     await loadFrom(S.store);
     S.route = { name: 'library' };
     closeSheet(); renderAll();
     toast('Backup restored');
   } catch (e) {
-    toast('Restoring stopped partway. Try again with the same file.');
+    toast('Couldn’t restore the backup. Nothing was changed.');
   }
+}
+// Checks a parsed backup file and returns a clean snapshot, or null if it isn't usable.
+function checkBackup(d) {
+  const isObj = (o) => !!o && typeof o === 'object' && !Array.isArray(o);
+  if (!isObj(d) || d.app !== 'serialist' || d.format !== 1 || !Array.isArray(d.novels) || !isObj(d.chapters)) return null;
+  if (d.profile != null && !isObj(d.profile)) return null;
+  if (d.boards != null && !isObj(d.boards)) return null;
+  const ids = new Set();
+  for (const n of d.novels) {
+    if (!isObj(n) || typeof n.id !== 'string' || !n.id || ids.has(n.id)) return null;
+    ids.add(n.id);
+  }
+  const chapters = {}, boards = {};
+  for (const n of d.novels) {
+    const list = d.chapters[n.id] == null ? [] : d.chapters[n.id];
+    if (!Array.isArray(list)) return null;
+    const seen = new Set();
+    for (const c of list) {
+      if (!isObj(c) || typeof c.id !== 'string' || !c.id || seen.has(c.id)) return null;
+      seen.add(c.id);
+      c.novelId = n.id;
+      c.n = chNum(c.n);
+      if (typeof c.text !== 'string') c.text = '';
+      if (typeof c.title !== 'string') c.title = '';
+      c.words = countWords(c.text);
+    }
+    // Missing, broken or repeated chapter numbers: number them again in their current order.
+    const nums = list.map((c) => c.n);
+    if (nums.some((k) => !k) || new Set(nums).size !== nums.length) {
+      list.slice().sort((a, b) => (a.n || Infinity) - (b.n || Infinity) || (a.createdAt || 0) - (b.createdAt || 0)).forEach((c, i) => { c.n = i + 1; });
+    }
+    chapters[n.id] = list;
+    const b = d.boards && d.boards[n.id];
+    if (isObj(b)) boards[n.id] = b;
+  }
+  return { exportedAt: d.exportedAt, profile: Object.assign(defaultProfile(), d.profile || {}), novels: d.novels, chapters, boards };
 }
 
 /* ---- install as an app ---- */
@@ -1782,7 +1849,7 @@ const A = {
   'ed-copy': () => { const ch = curChapter(); if (ch) copyText(`${ch.title ? ch.title + '\n\n' : ''}${ch.text || ''}`, 'Chapter copied'); },
   'ed-delete-ask': () => {
     const ch = curChapter();
-    $('#confirm-slot').innerHTML = `<div class="confirm"><p>Delete chapter ${ch.n}${ch.title ? ` “${esc(ch.title)}”` : ''} (${fmt(ch.words)} words)? Later chapters move up one number. This can’t be undone.</p><div class="row"><button class="btn btn-danger sm" data-act="ed-delete-confirm">Delete chapter</button><button class="btn btn-ghost sm" data-act="close-sheet">Keep it</button></div></div>`;
+    $('#confirm-slot').innerHTML = `<div class="confirm"><p>Delete chapter ${esc(ch.n)}${ch.title ? ` “${esc(ch.title)}”` : ''} (${fmt(ch.words)} words)? Later chapters move up one number. This can’t be undone.</p><div class="row"><button class="btn btn-danger sm" data-act="ed-delete-confirm">Delete chapter</button><button class="btn btn-ghost sm" data-act="close-sheet">Keep it</button></div></div>`;
   },
   'ed-delete-confirm': () => deleteChapter(),
   'ed-outline': () => outlineSheet(),

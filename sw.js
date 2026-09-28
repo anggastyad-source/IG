@@ -2,7 +2,7 @@
    It keeps a copy of the app files so Serialist opens without internet.
    When you change any file and publish again, raise the number in CACHE
    (serialist-v2, serialist-v3, ...) so phones pick up the new version. */
-const CACHE = 'serialist-v1';
+const CACHE = 'serialist-v2';
 const FILES = [
   './',
   './index.html',
