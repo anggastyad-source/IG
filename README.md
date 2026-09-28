@@ -73,16 +73,51 @@ After that, open Serialist from its icon. It works without internet.
 | `Plotfeed helpers and starter worlds` | Relationship labels, avatar colours, and the four ready-made worlds. |
 | `State` | Everything the app holds in memory (`S`). |
 | `Example novels` | The two example novels shown on first launch. |
-| `Storage` | Saving to IndexedDB, with a localStorage fallback. |
+| `Storage` | Saving to IndexedDB, with a localStorage fallback. Every save stamps `modAt` for sync. |
 | `Rendering` | The shelf, novel page, chapter list, story bible and editor. |
 | `Forms` | New novel, novel details, characters, world notes, word goal. |
 | `Plotfeed: the plotting board` | The feed, reactions, tension, threads and chapter outlines. |
 | `Gemini: the AI partner` | Your Gemini key, the Plotfeed partner and scene, and the editor's draft, polish and summary helpers. |
+| `Drive sync` | Google sign-in, the Drive copy, and merging changes from your other devices. |
 | `Settings, backup and restore` | Backup files, restore, and the install card. |
 | `Actions` | Every button's `data-act` name and what it runs. |
 | `Boot` | Opening storage, the first-run examples, and the offline worker. |
 
 To add a button: give it `data-act="my-action"` in the HTML, then add `'my-action': (el) => { ... }` to the `A` object in the **Actions** section.
+
+## Sync between your phone and laptop (Google Drive)
+
+Serialist can keep your novels the same on every device. It keeps a copy in a hidden app folder in your own Google Drive. The folder doesn't appear in Drive, and Serialist can't see anything else there.
+
+**One-time setup in Google Cloud** (about 10 minutes, free):
+
+1. Open **console.cloud.google.com** and create a project, for example `Serialist`.
+2. Go to **APIs & Services → Library**, search for **Google Drive API**, and click **Enable**.
+3. Go to **Google Auth Platform** (called **OAuth consent screen** in older menus) and click **Get started**:
+   - App name: `Serialist`. Use your email for support and contact.
+   - Audience: **External**.
+   - Under **Audience → Test users**, add your own Gmail address.
+   - Under **Data access → Add or remove scopes**, add `https://www.googleapis.com/auth/drive.appdata`.
+4. Go to **Clients → Create client** and choose **Web application**. Under **Authorised JavaScript origins**, add:
+   - `https://anggastyad-source.github.io`
+   - `http://127.0.0.1:5500` (for testing with Live Server)
+5. Click **Create**, then copy the **Client ID**. It ends in `.apps.googleusercontent.com`.
+
+**On each device:**
+
+1. Tap the sliders button, then under **Sync with Google Drive** paste the client ID and tap **Save client ID**.
+2. Tap **Connect Google Drive** and sign in with the same Google account on every device.
+3. If Google says it hasn't verified the app, tap **Continue**. It's your own app.
+
+**How it works:**
+
+- **When it syncs:** when the app opens, about 20 seconds after you stop making changes, when you switch away from the app, and when you tap **Sync now**.
+- **The top bar** shows **Synced** when both copies match.
+- **Tap to sync:** Google's sign-in lasts about an hour. After that the top bar shows **Tap to sync**, and one tap signs you in again.
+- **Same chapter changed on two devices:** if you changed the same chapter on both before syncing, you keep both versions. The second one is titled "(from other device)". Nothing is overwritten.
+- **Deletions** reach the other device.
+- **Example novels** stay on each device and aren't synced.
+- **Backup files still work,** and they're still a good extra safety net.
 
 ## The AI partner (Gemini)
 

@@ -489,3 +489,4 @@ dl,dd{margin:0}
 @media (prefers-reduced-motion: reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
 }
+.save-state[data-act]{cursor:pointer;text-decoration:underline dotted;text-underline-offset:3px}

@@ -190,7 +190,7 @@ const WORLDS = [
 /* =========================================================
    State
    ========================================================= */
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const defaultProfile = () => ({ dailyGoal: 1000, days: {}, last: null, edSize: 'm', lastBackup: null, installHidden: false });
 const S = {
   mode: 'connecting',   // device (IndexedDB) | local (localStorage) | memory
@@ -219,6 +219,12 @@ const S = {
   // Gemini partner (device-only settings, kept in store meta "ai", never in backups)
   ai: { key: '', model: '', models: [], partner: true, replies: 2 },
   pfErr: new Map(),     // post id -> partner error shown under that post
+  // Drive sync (device-only settings in store meta "sync"; the token lasts about an hour)
+  sync: { clientId: '', connected: false, token: '', exp: 0, lastSyncAt: 0, fileId: '' },
+  syncState: 'idle',    // idle | busy | tap | error
+  syncMsg: '',
+  changes: 0,           // local changes made in this session
+  syncedChanges: 0,     // value of `changes` at the last finished sync
 };
 
 /* =========================================================
@@ -520,10 +526,12 @@ async function exec(fn) {
   catch (e) { onSaveError(e); }
   finally { S.pending--; paintSave(); }
 }
-const saveNovel = (id, delay = 600) => queue('n:' + id, (st) => { const n = S.novels.get(id); return n ? st.saveNovel(clone(n)) : null; }, delay);
-const saveChapter = (nid, cid, delay = 900) => queue('c:' + cid, (st) => { const c = S.chapters.get(nid)?.get(cid); return c ? st.saveChapter(nid, clone(c)) : null; }, delay);
-const saveProfile = (delay = 1500) => queue('p', (st) => st.saveProfile(clone(S.profile)), delay);
-const saveEngine = (nid, delay = 800) => queue('e:' + nid, (st) => { const e = S.engines.get(nid); return e ? st.saveEngine(nid, clone(e)) : null; }, delay);
+// Every change stamps its record with modAt, which Drive sync uses to decide which copy is newer.
+const stamp = (o) => { if (o) { o.modAt = Date.now(); S.changes++; syncSoon(); } };
+const saveNovel = (id, delay = 600) => { stamp(S.novels.get(id)); queue('n:' + id, (st) => { const n = S.novels.get(id); return n ? st.saveNovel(clone(n)) : null; }, delay); };
+const saveChapter = (nid, cid, delay = 900) => { stamp(S.chapters.get(nid)?.get(cid)); queue('c:' + cid, (st) => { const c = S.chapters.get(nid)?.get(cid); return c ? st.saveChapter(nid, clone(c)) : null; }, delay); };
+const saveProfile = (delay = 1500) => { stamp(S.profile); queue('p', (st) => st.saveProfile(clone(S.profile)), delay); };
+const saveEngine = (nid, delay = 800) => { stamp(S.engines.get(nid)); queue('e:' + nid, (st) => { const e = S.engines.get(nid); return e ? st.saveEngine(nid, clone(e)) : null; }, delay); };
 
 function onSaveError(e) {
   S.saveError = true;
@@ -534,11 +542,21 @@ function saveLabel() {
   if (!S.store) return { t: 'Opening…', c: 'wait' };
   if (S.pending || timers.size) return { t: 'Saving…', c: 'wait' };
   if (S.saveError || S.mode === 'memory') return { t: 'Not saved', c: 'err' };
+  if (syncOn()) {
+    if (S.syncState === 'busy') return { t: 'Syncing…', c: 'wait' };
+    if (S.syncState === 'error') return { t: 'Sync failed', c: 'err', act: 'sync-now' };
+    if (!tokenOk()) return { t: 'Tap to sync', c: 'wait', act: 'sync-now' };
+    if (S.changes === S.syncedChanges && S.sync.lastSyncAt) return { t: 'Synced', c: 'ok' };
+  }
   return { t: 'Saved', c: 'ok' };
 }
 function paintSave() {
-  const { t, c } = saveLabel();
-  $$('.save-state').forEach((el) => { el.textContent = t; el.dataset.state = c; });
+  const { t, c, act } = saveLabel();
+  $$('.save-state').forEach((el) => {
+    el.textContent = t; el.dataset.state = c;
+    if (act) { el.dataset.act = act; el.setAttribute('role', 'button'); el.tabIndex = 0; }
+    else { delete el.dataset.act; el.removeAttribute('role'); el.removeAttribute('tabindex'); }
+  });
 }
 
 const chNum = (v) => { const k = Math.floor(Number(v)); return k > 0 ? k : 0; };
@@ -1111,6 +1129,7 @@ async function deleteChapter() {
   S.route = { name: 'novel', novelId: n.id };
   touchNovel(n.id, 200);
   exec((st) => st.deleteChapter(n.id, ch.id));
+  markDeleted('c:' + ch.id);
   renderAll();
   toast(`Chapter ${ch.n} deleted`);
 }
@@ -1122,6 +1141,7 @@ async function deleteNovel() {
   closeSheet();
   go({ name: 'library' });
   exec((st) => st.deleteNovel(n.id));
+  markDeleted('n:' + n.id);
   toast(`“${n.title}” deleted`);
 }
 function exportTextSync(n) {
@@ -2136,6 +2156,272 @@ function aiApply(kind) {
 }
 
 /* =========================================================
+   Drive sync: your novels in a hidden app folder of your own Google Drive
+   ========================================================= */
+const DRIVE = 'https://www.googleapis.com/drive/v3';
+const DRIVE_UP = 'https://www.googleapis.com/upload/drive/v3';
+const SYNC_FILE = 'serialist-sync.json';
+const syncOn = () => !!(S.sync.clientId && S.sync.connected);
+const tokenOk = () => !!(S.sync.token && S.sync.exp > Date.now() + 60e3);
+const saveSync = () => exec((st) => st.saveMeta('sync', clone(S.sync)));
+const syncErr = (code) => Object.assign(new Error(code), { code });
+const SYNC_MSG = {
+  offline: 'Sync needs internet. Your novels are saved on this device and will sync later.',
+  auth: 'Google needs you to sign in again. Tap “Tap to sync”.',
+  denied: 'Google sign-in was cancelled.',
+  popup: 'The browser blocked the Google sign-in window. Allow pop-ups for this site, then try again.',
+  limit: 'Google Drive refused the request. Check that the Drive API is enabled for your client ID.',
+  server: 'Google Drive had a problem. Try again in a moment.',
+  damaged: 'The sync copy in your Drive is damaged, so nothing was changed here. Use “Replace the Drive copy” to fix it.',
+};
+const syncMsg = (e) => SYNC_MSG[e && e.code] || SYNC_MSG.server;
+
+let tomb = {}; // "n:<novelId>" | "c:<chapterId>" | "b:<novelId>" -> when it was deleted
+function markDeleted(k) { tomb[k] = Date.now(); S.changes++; exec((st) => st.saveMeta('tomb', clone(tomb))); syncSoon(); }
+
+/* ---- Google sign-in (Google Identity Services, loaded only when sync is set up) ---- */
+let gisP = null;
+function loadGis() {
+  if (window.google && google.accounts && google.accounts.oauth2) return Promise.resolve();
+  if (!gisP) {
+    gisP = new Promise((resolve, reject) => {
+      const s = document.createElement('script');
+      s.src = 'https://accounts.google.com/gsi/client'; s.async = true;
+      s.onload = () => resolve();
+      s.onerror = () => { gisP = null; s.remove(); reject(syncErr('offline')); };
+      document.head.appendChild(s);
+    });
+  }
+  return gisP;
+}
+function driveSignIn(consent) {
+  return loadGis().then(() => new Promise((resolve, reject) => {
+    const tc = google.accounts.oauth2.initTokenClient({
+      client_id: S.sync.clientId,
+      scope: 'https://www.googleapis.com/auth/drive.appdata',
+      callback: (r) => {
+        if (r && r.access_token) { S.sync.token = r.access_token; S.sync.exp = Date.now() + (Number(r.expires_in) || 3600) * 1000; saveSync(); resolve(); }
+        else reject(syncErr('denied'));
+      },
+      error_callback: (e) => reject(syncErr(e && e.type === 'popup_failed_to_open' ? 'popup' : 'denied')),
+    });
+    tc.requestAccessToken({ prompt: consent ? 'consent' : '' });
+  }));
+}
+
+/* ---- Drive calls ---- */
+async function drive(url, opts = {}) {
+  let res;
+  try { res = await fetch(url, Object.assign({}, opts, { headers: Object.assign({ Authorization: 'Bearer ' + S.sync.token }, opts.headers || {}) })); }
+  catch (e) { throw syncErr('offline'); }
+  if (res.status === 401) { S.sync.token = ''; S.sync.exp = 0; saveSync(); throw syncErr('auth'); }
+  if (res.status === 404) throw syncErr('notfound');
+  if (res.status === 403 || res.status === 429) throw syncErr('limit');
+  if (!res.ok) throw syncErr('server');
+  return res;
+}
+async function driveFind() {
+  const q = encodeURIComponent(`name='${SYNC_FILE}' and trashed=false`);
+  const r = await (await drive(`${DRIVE}/files?spaces=appDataFolder&fields=files(id,version)&q=${q}`)).json();
+  return (r.files && r.files[0]) || null;
+}
+async function driveVersion(id) {
+  try { return (await (await drive(`${DRIVE}/files/${id}?fields=version`)).json()).version; }
+  catch (e) { if (e.code === 'notfound') return null; throw e; }
+}
+async function driveUpload(id, snap) {
+  const body = JSON.stringify(snap);
+  if (id) {
+    await drive(`${DRIVE_UP}/files/${id}?uploadType=media`, { method: 'PATCH', headers: { 'content-type': 'application/json' }, body });
+    return id;
+  }
+  const b = 'serialist' + Math.random().toString(36).slice(2);
+  const meta = JSON.stringify({ name: SYNC_FILE, parents: ['appDataFolder'], mimeType: 'application/json' });
+  const res = await drive(`${DRIVE_UP}/files?uploadType=multipart&fields=id`, {
+    method: 'POST', headers: { 'content-type': `multipart/related; boundary=${b}` },
+    body: `--${b}\r\ncontent-type: application/json; charset=UTF-8\r\n\r\n${meta}\r\n--${b}\r\ncontent-type: application/json\r\n\r\n${body}\r\n--${b}--`,
+  });
+  return (await res.json()).id;
+}
+
+/* ---- merging this device with the Drive copy ---- */
+const modT = (o) => (o && (o.modAt || o.updatedAt)) || 0;
+// Compare JSON-like values regardless of key order.
+const stable = (o) => JSON.stringify(o, (k, v) => (v && typeof v === 'object' && !Array.isArray(v) ? Object.keys(v).sort().reduce((a, x) => { a[x] = v[x]; return a; }, {}) : v));
+const same = (a, b) => stable(a) === stable(b);
+function mergeSync(local, remote, rTomb, since) {
+  const now = Date.now();
+  const T = Object.assign({}, rTomb || {});
+  Object.entries(tomb).forEach(([k, v]) => { if (!(T[k] >= v)) T[k] = v; });
+  Object.keys(T).forEach((k) => { if (now - T[k] > 180 * 86400e3) delete T[k]; }); // forget very old deletions
+  const R = remote || { profile: null, novels: [], chapters: {}, boards: {} };
+  let toLocal = false, toRemote = !remote;
+  // Choose between the two copies of a record; note which side has to change.
+  const choose = (l, r, tk) => {
+    const w = !l ? r : !r ? l : modT(r) > modT(l) ? r : l;
+    if (T[tk] >= modT(w)) { if (l) toLocal = true; if (r) toRemote = true; return null; }
+    if (w === r && (!l || modT(l) !== modT(r))) toLocal = true;
+    if (w === l && (!r || modT(l) !== modT(r))) toRemote = true;
+    return w;
+  };
+  const byId = (list) => new Map((list || []).map((x) => [x.id, x]));
+  const Ln = byId(local.novels.filter((n) => !n.example)), Rn = byId(R.novels);
+  const novels = [], chapters = {}, boards = {};
+  new Set([...Ln.keys(), ...Rn.keys()]).forEach((id) => {
+    const n = choose(Ln.get(id), Rn.get(id), 'n:' + id); if (!n) return;
+    const Lc = byId(local.chapters[id]), Rc = byId(R.chapters[id]), list = [];
+    new Set([...Lc.keys(), ...Rc.keys()]).forEach((cid) => {
+      const a = Lc.get(cid), b = Rc.get(cid);
+      if (a && b && modT(a) !== modT(b) && modT(a) > since && modT(b) > since && a.text !== b.text && !(T['c:' + cid] >= Math.max(modT(a), modT(b)))) {
+        // Both devices changed this chapter since the last sync: keep both, never lose text.
+        list.push(a, Object.assign(clone(b), { id: newId(), title: `${b.title || 'Untitled chapter'} (from other device)`, n: 0, modAt: now }));
+        toLocal = toRemote = true;
+        return;
+      }
+      const c = choose(a, b, 'c:' + cid); if (c) list.push(c);
+    });
+    const nums = list.map((c) => c.n);
+    if (nums.some((k) => !k) || new Set(nums).size !== nums.length) {
+      list.sort((x, y) => (x.n || Infinity) - (y.n || Infinity) || (x.createdAt || 0) - (y.createdAt || 0)).forEach((c, i) => { if (c.n !== i + 1) { c.n = i + 1; c.modAt = now; toLocal = toRemote = true; } });
+    }
+    n.chapterCount = list.length; n.wordCount = list.reduce((s, c) => s + (c.words || 0), 0);
+    novels.push(n); chapters[id] = list;
+    const bd = choose(local.boards[id], R.boards[id], 'b:' + id); if (bd) boards[id] = bd;
+  });
+  // Profile: the newer settings win; words written per day take the higher count.
+  const lp = local.profile, rp = R.profile;
+  const p = clone(!rp || modT(lp) >= modT(rp) ? lp : rp);
+  const days = Object.assign({}, lp.days || {});
+  Object.entries((rp && rp.days) || {}).forEach(([k, v]) => { if (!(days[k] >= v)) days[k] = v; });
+  p.days = days;
+  if (!same(p, lp)) toLocal = true;
+  if (!rp || !same(p, rp)) toRemote = true;
+  if (!same(T, rTomb || {})) toRemote = true;
+  const ex = local.novels.filter((n) => n.example); // example novels stay on this device only
+  return {
+    toLocal, toRemote, tomb: T,
+    local: {
+      profile: p, novels: [...novels, ...ex],
+      chapters: Object.assign({}, chapters, ...ex.map((n) => ({ [n.id]: local.chapters[n.id] || [] }))),
+      boards: Object.assign({}, boards, ...ex.filter((n) => local.boards[n.id]).map((n) => ({ [n.id]: local.boards[n.id] }))),
+    },
+    remote: { app: 'serialist', format: 1, kind: 'sync', exportedAt: new Date(now).toISOString(), profile: p, novels, chapters, boards, tomb: T },
+  };
+}
+
+/* ---- one sync round ---- */
+let syncing = null, syncAgain = false, syncT = null;
+function syncSoon(delay = 20000) {
+  if (!syncOn()) return;
+  clearTimeout(syncT);
+  syncT = setTimeout(() => { if (tokenOk()) syncNow(false); else paintSave(); }, delay);
+}
+function syncNow(interactive, force) {
+  if (!syncOn() || !S.store) return Promise.resolve();
+  if (syncing) { syncAgain = true; return syncing; }
+  clearTimeout(syncT);
+  syncing = runSync(interactive, force)
+    .then(() => { S.syncState = 'idle'; S.syncMsg = ''; })
+    .catch((e) => {
+      S.syncState = e.code === 'auth' || e.code === 'denied' ? 'tap' : 'error';
+      S.syncMsg = e.code === 'auth' && !interactive ? '' : syncMsg(e);
+      if (interactive) toast(S.syncMsg);
+    })
+    .finally(() => {
+      syncing = null; paintSave(); refreshSettings();
+      if (syncAgain) { syncAgain = false; syncSoon(4000); }
+    });
+  paintSave();
+  return syncing;
+}
+async function runSync(interactive, force) {
+  if (!tokenOk()) {
+    if (!interactive) throw syncErr('auth');
+    await driveSignIn(false);
+  }
+  S.syncState = 'busy'; paintSave();
+  await flushAll();
+  const mark = S.changes;
+  const local = await buildBackup();
+  let file = S.sync.fileId ? { id: S.sync.fileId, version: null } : null;
+  let remote = null, rTomb = {};
+  if (file) { file.version = await driveVersion(file.id); if (file.version == null) file = null; }
+  if (!file) file = await driveFind();
+  if (file && !force) {
+    let d = null;
+    try { d = await (await drive(`${DRIVE}/files/${file.id}?alt=media`)).json(); }
+    catch (e) { if (e.code === 'notfound') file = null; else if (e.code) throw e; else throw syncErr('damaged'); }
+    if (file) {
+      remote = checkBackup(d);
+      if (!remote) throw syncErr('damaged');
+      rTomb = d.tomb && typeof d.tomb === 'object' ? d.tomb : {};
+    }
+  }
+  const out = mergeSync(local, remote, rTomb, S.sync.lastSyncAt || 0);
+  // Something changed here while we were talking to Drive: try again in a moment.
+  if (S.changes !== mark || timers.size) { syncAgain = true; return; }
+  if (out.toLocal && !(await applySynced(out.local, local))) { syncAgain = true; return; }
+  if (!same(out.tomb, tomb)) { tomb = out.tomb; await S.store.saveMeta('tomb', clone(tomb)); }
+  if (out.toRemote || !file) {
+    if (file && file.version != null && (await driveVersion(file.id)) !== file.version) { syncAgain = true; return; } // the other device just synced
+    S.sync.fileId = await driveUpload(file ? file.id : '', out.remote);
+  } else S.sync.fileId = file.id;
+  S.sync.lastSyncAt = Date.now();
+  S.syncedChanges = mark;
+  saveSync();
+}
+// Swap the merged data in and redraw, keeping the chapter you're writing in place.
+async function applySynced(snap, before) {
+  const sh = $('#sheet');
+  if (!sh.hidden && sh.getAttribute('aria-label') !== 'Backup and settings') return false; // a form is open: wait
+  const r = S.route;
+  const ta = r.name === 'editor' ? $('#ed-text') : null, ti = r.name === 'editor' ? $('#ed-title') : null;
+  await S.store.replaceAll(snap);
+  await loadFrom(S.store);
+  if (r.novelId && S.novels.has(r.novelId)) { await ensureChapters(r.novelId); await ensureEngine(r.novelId); }
+  S.route = r;
+  const ch = curChapter();
+  if (ta && ch) {
+    const old = (before.chapters[r.novelId] || []).find((c) => c.id === ch.id);
+    if (old && old.text === ch.text && ti.value === ch.title) {
+      // This chapter didn't change on the other device: keep anything typed in the last moment.
+      if (ta.value !== ch.text) { ch.text = ta.value; ch.words = countWords(ch.text); saveChapter(r.novelId, ch.id, 0); }
+      paintCounts(); paintSave();
+      return true;
+    }
+  }
+  renderAll();
+  refreshSettings();
+  return true;
+}
+function refreshSettings() {
+  const sh = $('#sheet');
+  if (sh.hidden || sh.getAttribute('aria-label') !== 'Backup and settings') return;
+  const top = sh.scrollTop; settingsSheet(); sh.scrollTop = top;
+}
+function syncSettingsHTML() {
+  const Y = S.sync;
+  let body;
+  if (!Y.clientId) {
+    body = `<p class="hint">Keep your novels the same on your phone and laptop through a hidden folder in your own Google Drive. It needs a one-time setup in Google Cloud: see “Sync setup” in the README.</p>
+      <label class="field"><span>Google OAuth client ID</span><input id="sync-client" autocomplete="off" spellcheck="false" placeholder="…apps.googleusercontent.com"></label>
+      <div class="row"><button class="btn btn-accent sm" data-act="sync-client-save">Save client ID</button></div>`;
+  } else if (!Y.connected) {
+    body = `<p class="hint">Sign in with the Google account whose Drive should hold your novels. Serialist can only see its own hidden folder there, nothing else in your Drive.</p>
+      <div class="row"><button class="btn btn-accent sm" data-act="sync-connect">${icon('rewrite')} Connect Google Drive</button><button class="link" data-act="sync-client-clear">Change client ID</button></div>`;
+  } else {
+    body = `<p class="hint">${S.syncState === 'busy' ? 'Syncing now…' : Y.lastSyncAt ? `Last synced ${esc(ago(Y.lastSyncAt))}.` : 'Not synced yet.'} Example novels stay on each device.</p>
+      <div class="row"><button class="btn btn-accent sm" data-act="sync-now">${icon('rewrite')} Sync now</button><button class="btn btn-ghost sm" data-act="sync-off">Disconnect</button></div>
+      ${S.syncMsg && /damaged/.test(S.syncMsg) ? `<button class="link" data-act="sync-replace">Replace the Drive copy with this device</button>` : ''}`;
+  }
+  return `<section class="set-sec">
+    <span class="eyebrow">${icon('rewrite')} Sync with Google Drive</span>
+    ${body}
+    ${S.syncMsg ? `<p class="note-bar" style="margin:0">${esc(S.syncMsg)}</p>` : ''}
+  </section>`;
+}
+
+/* =========================================================
    Settings, backup and restore
    ========================================================= */
 function downloadFile(name, text, type) {
@@ -2166,11 +2452,13 @@ function settingsSheet() {
     <p class="hint" style="margin-top:12px">${last ? `Last backup ${esc(ago(last))}.` : 'No backup saved yet.'} A backup holds every novel, chapter, story bible and Plotfeed board. Keep it somewhere safe, like Google Drive.</p>
     <input type="file" id="bk-file" accept="application/json,.json" hidden>
     <div id="confirm-slot"></div>
+    ${syncSettingsHTML()}
     ${aiSettingsHTML()}
     <p class="hint" style="margin-top:18px">Serialist ${APP_VERSION}</p>`, 'Backup and settings');
   $('#bk-file').addEventListener('change', onRestoreFile);
   $('#ai-model')?.addEventListener('change', (e) => { S.ai.model = e.target.value; saveAi(); toast('Gemini model changed'); });
   $('#ai-key')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); aiSaveKey(); } });
+  if (S.sync.clientId && navigator.onLine !== false) loadGis().catch(() => {}); // ready before a tap, so the sign-in window isn't blocked
 }
 function aiSettingsHTML() {
   const A2 = S.ai;
@@ -2370,6 +2658,28 @@ const A = {
   'ai-insert': () => aiApply('insert'),
   'ai-replace': () => aiApply('replace'),
   'ai-copy': () => { const t = $('#ai-text'); if (t) copyText(t.value, 'Copied'); },
+  'sync-client-save': () => {
+    const inp = $('#sync-client'), v = (inp ? inp.value : '').trim();
+    if (!/^[\w-]+\.apps\.googleusercontent\.com$/.test(v)) { S.syncMsg = 'That doesn’t look like an OAuth client ID. It ends in .apps.googleusercontent.com.'; refreshSettings(); return; }
+    S.sync.clientId = v; S.syncMsg = ''; saveSync(); refreshSettings();
+  },
+  'sync-client-clear': () => { S.sync = { clientId: '', connected: false, token: '', exp: 0, lastSyncAt: 0, fileId: '' }; S.syncMsg = ''; S.syncState = 'idle'; saveSync(); refreshSettings(); paintSave(); },
+  'sync-connect': async () => {
+    try { await driveSignIn(true); } catch (e) { S.syncMsg = syncMsg(e); refreshSettings(); return; }
+    Object.assign(S.sync, { connected: true, lastSyncAt: 0, fileId: '' }); S.syncMsg = '';
+    saveSync();
+    await syncNow(true);
+    if (!S.syncMsg) toast('Google Drive connected. Your novels are synced.');
+  },
+  'sync-now': () => { S.syncMsg = ''; syncNow(true).then(() => { if (!S.syncMsg && S.syncState === 'idle') toast('Synced with Google Drive'); }); },
+  'sync-replace': () => { S.syncMsg = ''; syncNow(true, true).then(() => { if (!S.syncMsg) toast('The Drive copy now matches this device'); }); },
+  'sync-off': () => {
+    try { if (S.sync.token && window.google && google.accounts && google.accounts.oauth2) google.accounts.oauth2.revoke(S.sync.token, () => {}); } catch (e) {}
+    Object.assign(S.sync, { connected: false, token: '', exp: 0, lastSyncAt: 0, fileId: '' });
+    S.syncMsg = ''; S.syncState = 'idle';
+    saveSync(); refreshSettings(); paintSave();
+    toast('Disconnected. Your novels stay on this device and in your Drive.');
+  },
   'ai-save': () => aiSaveKey(),
   'ai-test': () => aiSaveKey(),
   'ai-remove': () => {
@@ -2549,6 +2859,7 @@ const A = {
     const t = timers.get('e:' + n.id); if (t) { clearTimeout(t.id); timers.delete('e:' + n.id); }
     S.engines.set(n.id, null); S.pfReply = null;
     exec((st) => st.deleteEngine(n.id));
+    markDeleted('b:' + n.id);
     closeSheet(); renderNovel();
     toast('Plotfeed reset');
   },
@@ -2564,7 +2875,13 @@ document.addEventListener('keydown', (e) => {
   if (e.key === 'Escape' && !$('#sheet').hidden) closeSheet();
   if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && e.target && e.target.id === 'rx-input') { e.preventDefault(); pfRxAdd(); }
 });
-document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden') flushAll(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    flushAll();
+    if (syncOn() && tokenOk() && S.changes !== S.syncedChanges) syncNow(false); // leaving the app: send your changes
+  } else if (syncOn() && tokenOk() && Date.now() - (S.sync.lastSyncAt || 0) > 120e3) syncNow(false); // back: fetch the other device's
+});
+window.addEventListener('online', () => { if (syncOn() && tokenOk() && S.changes !== S.syncedChanges) syncNow(false); });
 window.addEventListener('pagehide', () => { flushAll(); });
 
 /* =========================================================
@@ -2623,9 +2940,17 @@ async function boot() {
   catch (e) { LocalStore.load(); store = LocalStore; S.mode = LocalStore.ok ? 'local' : 'memory'; await loadFrom(store); }
   S.store = store;
   try { const ai = await store.getMeta('ai'); if (ai && typeof ai === 'object') Object.assign(S.ai, ai); } catch (e) {}
+  try {
+    const sy = await store.getMeta('sync'); if (sy && typeof sy === 'object') Object.assign(S.sync, sy);
+    const tb = await store.getMeta('tomb'); if (tb && typeof tb === 'object') tomb = tb;
+  } catch (e) {}
   if (S.firstRun) await seedStore();
   renderAll();
   askPersist();
+  if (syncOn()) {
+    if (navigator.onLine !== false) loadGis().catch(() => {});
+    if (tokenOk()) syncNow(false);
+  }
 }
 registerServiceWorker();
 boot();
