@@ -6,7 +6,6 @@
   "liveServer.settings.CustomBrowser": "chrome",
   "liveServer.settings.ignoreFiles": [
     ".vscode/**",
-    "serialist-app/**",
     "**/*.md"
   ],
 
@@ -19,10 +18,5 @@
 
   "files.associations": {
     "*.webmanifest": "json"
-  },
-
-  // The nested serialist-app/ folder is a duplicate copy; keep it out of search results
-  "search.exclude": {
-    "serialist-app/**": true
   }
 }
