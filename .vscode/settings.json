@@ -1,0 +1,28 @@
+{
+  // Live Server: serve this folder at http://127.0.0.1:5500 (the address the README uses)
+  "liveServer.settings.port": 5500,
+  "liveServer.settings.host": "127.0.0.1",
+  "liveServer.settings.root": "/",
+  "liveServer.settings.CustomBrowser": "chrome",
+  "liveServer.settings.ignoreFiles": [
+    ".vscode/**",
+    "serialist-app/**",
+    "**/*.md"
+  ],
+
+  // Editor defaults matching the existing code (2-space indent, LF)
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "files.eol": "\n",
+  "files.insertFinalNewline": true,
+  "files.trimTrailingWhitespace": true,
+
+  "files.associations": {
+    "*.webmanifest": "json"
+  },
+
+  // The nested serialist-app/ folder is a duplicate copy; keep it out of search results
+  "search.exclude": {
+    "serialist-app/**": true
+  }
+}
