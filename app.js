@@ -190,7 +190,7 @@ const WORLDS = [
 /* =========================================================
    State
    ========================================================= */
-const APP_VERSION = '1.0.1';
+const APP_VERSION = '1.1.0';
 const defaultProfile = () => ({ dailyGoal: 1000, days: {}, last: null, edSize: 'm', lastBackup: null, installHidden: false });
 const S = {
   mode: 'connecting',   // device (IndexedDB) | local (localStorage) | memory
@@ -214,8 +214,11 @@ const S = {
   pfMode: 'do',         // do | say | cast | world
   pfWho: null,          // who acts when the mode is "cast"
   pfT: 0,               // tension change for the next entry
-  pfReply: null,        // { postId, author, text, rel } while writing a reaction
+  pfReply: null,        // { postId, author, text, rel, editId?, sugs?, busy? } while writing a reaction
   pfDraft: null,
+  // Gemini partner (device-only settings, kept in store meta "ai", never in backups)
+  ai: { key: '', model: '', models: [], partner: true, replies: 2 },
+  pfErr: new Map(),     // post id -> partner error shown under that post
 };
 
 /* =========================================================
@@ -1073,8 +1076,11 @@ async function newChapter() {
   touchNovel(n.id, 300);
   openChapter(n.id, ch.id);
 }
+let edSel = { s: 0, e: 0 }; // the text selected in the editor when its menu opened
 function editorMenu() {
   const ch = curChapter(); if (!ch) return;
+  const ta = $('#ed-text');
+  edSel = ta ? { s: ta.selectionStart || 0, e: ta.selectionEnd || 0 } : { s: 0, e: 0 };
   const size = S.profile.edSize || 'm';
   openSheet(`
     <div class="sheet-head"><h3>Chapter ${esc(ch.n)}</h3>${closeBtn}</div>
@@ -1082,9 +1088,10 @@ function editorMenu() {
       <div class="field"><span class="field-label">Status</span><div class="seg">${Object.entries(STATUS).map(([k, l]) => `<button aria-pressed="${ch.status === k}" data-act="ed-status" data-v="${k}">${l}</button>`).join('')}</div></div>
       <div class="field"><span class="field-label">Text size</span><div class="seg">${[['s', 'Small'], ['m', 'Medium'], ['l', 'Large']].map(([k, l]) => `<button aria-pressed="${size === k}" data-act="ed-size" data-v="${k}">${l}</button>`).join('')}</div></div>
       <label class="field"><span>Chapter summary</span><textarea id="ed-recap" rows="3" maxlength="1200" placeholder="Two or three sentences on what happens. It shows in the chapter list."></textarea></label>
-      <div class="row"><button class="btn btn-ghost sm" data-act="ed-recap-save">Save summary</button></div>
+      <div class="row"><button class="btn btn-ghost sm" data-act="ed-recap-save">Save summary</button>${aiReady() ? `<button class="btn btn-ghost sm" data-act="ed-summary">${icon('spark')} Write it with Gemini</button>` : ''}</div>
     </div>
     <div class="menu" style="margin-top:14px">
+      ${aiReady() ? `<button class="menu-item" data-act="ed-polish">${icon('spark')}<span>Polish selected text with Gemini</span></button>` : ''}
       <button class="menu-item" data-act="ed-copy">${icon('copy')}<span>Copy chapter text</span></button>
       <button class="menu-item danger" data-act="ed-delete-ask">${icon('trash')}<span>Delete chapter</span></button>
     </div>
@@ -1156,7 +1163,7 @@ const isBeat = (p) => p.kind !== 'system';
 
 function newEngine(n, mcId) {
   const mc = charInfo(n, mcId);
-  return { v: 2, mc: mcId, mcName: mc.name, tension: 10, crisis: false, rel: {}, threads: [],
+  return { v: 2, mc: mcId, mcName: mc.name, tension: 10, crisis: false, rel: {}, threads: [], scene: { text: '', present: [] },
     posts: [sysItem('start', `Plotfeed started. You play ${mc.name}. Log what they do, then write how the cast of ${n.title} reacts.`)] };
 }
 function normEngine(e) {
@@ -1166,6 +1173,8 @@ function normEngine(e) {
   e.rel = e.rel && typeof e.rel === 'object' ? e.rel : {};
   e.tension = clamp(Math.round(Number(e.tension) || 0), 0, 100);
   e.posts.forEach((p) => { if (!Array.isArray(p.reactions)) p.reactions = []; if (p.ch === undefined) p.ch = null; delete p.pending; });
+  const sc = e.scene && typeof e.scene === 'object' ? e.scene : {};
+  e.scene = { text: typeof sc.text === 'string' ? sc.text : '', present: Array.isArray(sc.present) ? sc.present.filter((x) => typeof x === 'string') : [] };
   delete e.beats; delete e.dms;
   return e;
 }
@@ -1231,6 +1240,7 @@ function pfStateHTML(n, eng) {
       <div class="bar" role="meter" aria-label="Tension" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${t}"><i class="${t >= 75 || eng.crisis ? 'hot' : ''}" style="width:${t}%"></i></div>
       <p class="meter-note">${esc(note)}</p>
     </div>
+    ${pfSceneHTML(n, eng)}
     <div class="pf-chips">
       <button class="chip" data-act="pf-cast">${icon('users')} Cast · ${cast.length}</button>
       <button class="chip" data-act="pf-threads">${icon('hook')} ${open} open ${open === 1 ? 'thread' : 'threads'}</button>
@@ -1271,8 +1281,13 @@ function deltaHTML(d) {
 }
 function pfActionsHTML(n, eng, p) {
   const open = S.pfReply && S.pfReply.postId === p.id;
-  return `<div class="pf-actions">
+  const hasAi = p.reactions.some((r) => r.ai);
+  return `${p.pending ? `<div class="pf-pending"><span class="dots"><i></i><i></i><i></i></span> The cast is replying…</div>` : ''}
+    ${S.pfErr.has(p.id) ? `<p class="pf-err">${esc(S.pfErr.get(p.id))}</p>` : ''}
+    ${pfCardHTML(n, eng, p)}
+    <div class="pf-actions">
       <button class="pf-act" data-act="pf-react" data-id="${esc(p.id)}" aria-expanded="${open}">${icon('chat')} React</button>
+      ${aiReady() && !p.pending ? `<button class="pf-act" data-act="pf-redo" data-id="${esc(p.id)}">${icon(hasAi ? 'rewrite' : 'spark')} ${hasAi ? 'Redo replies' : 'Cast replies'}</button>` : ''}
       <button class="pf-act" data-act="pf-del" data-id="${esc(p.id)}">${icon('trash')} Remove</button>
       ${p.ch != null ? `<span class="pf-used">In chapter ${esc(p.ch)}</span>` : ''}
     </div>
@@ -1281,7 +1296,7 @@ function pfActionsHTML(n, eng, p) {
 function pfItemHTML(n, eng, p) {
   const cls = fresh.has(p.id) ? ' enter' : '';
   if (p.kind === 'system') {
-    const ic = p.sub === 'crisis' ? 'flame' : p.sub === 'chapter' ? 'recap' : 'feed';
+    const ic = p.sub === 'crisis' ? 'flame' : p.sub === 'chapter' ? 'recap' : p.sub === 'scene' ? 'signpost' : 'feed';
     return `<div class="pf-sys${p.sub === 'crisis' ? ' crisis' : ''}${cls}">${icon(ic)}<span>${esc(p.text)}</span></div>`;
   }
   const thread = (p.reactions || []).length ? `<div class="pf-thread">${p.reactions.map((r) => pfReplyHTML(n, p, r)).join('')}</div>` : '';
@@ -1306,7 +1321,7 @@ function pfItemHTML(n, eng, p) {
 function pfReplyHTML(n, p, r) {
   const a = charInfo(n, r.author, r.an);
   return `<div class="pf-reply${fresh.has(r.id) ? ' enter' : ''}">${avHTML(a, 30)}<div class="pf-body">
-    <div class="pf-meta"><span class="pf-name">${esc(a.name)}</span><span>@${esc(a.handle)}</span><button class="rx-del" data-act="pf-rx-del" data-id="${esc(p.id)}" data-rid="${esc(r.id)}" aria-label="Remove ${esc(a.name)}’s reaction">${icon('close')}</button></div>
+    <div class="pf-meta"><span class="pf-name">${esc(a.name)}</span><span>@${esc(a.handle)}</span>${r.ai ? '<span class="pf-kind ai">Partner</span>' : ''}<span class="rx-btns"><button class="rx-del" data-act="pf-rx-edit" data-id="${esc(p.id)}" data-rid="${esc(r.id)}" aria-label="Edit ${esc(a.name)}’s reaction">${icon('edit')}</button><button class="rx-del" data-act="pf-rx-del" data-id="${esc(p.id)}" data-rid="${esc(r.id)}" aria-label="Remove ${esc(a.name)}’s reaction">${icon('close')}</button></span></div>
     <p class="pf-text">${rich(r.text)}</p></div></div>`;
 }
 function pfReplyFormHTML(n, eng, p) {
@@ -1323,9 +1338,12 @@ function pfReplyFormHTML(n, eng, p) {
     <div class="rx-head">${avHTML(i, 30)}<b>${esc(i.name)}</b><span class="rel ${relClass(cur)}">${esc(relLabel(cur))}</span><span class="spacer"></span><button class="link" data-act="pf-rx-who" data-id="">Someone else</button></div>
     <label class="sr-only" for="rx-input">What ${esc(i.name)} says or does</label>
     <textarea id="rx-input" rows="2" maxlength="400" placeholder="What does ${esc(i.name)} say or do?">${esc(R.text || '')}</textarea>
-    ${i.voice.length ? `<div class="rx-sugs" aria-label="Sample lines">${i.voice.slice(0, 6).map((v, k) => `<button class="rx-sug" data-act="pf-rx-sug" data-k="${k}">${esc(v)}</button>`).join('')}</div>` : ''}
+    ${i.voice.length ? `<div class="rx-sugs" aria-label="Sample lines">${i.voice.slice(0, 6).map((v) => `<button class="rx-sug" data-act="pf-rx-sug" data-text="${esc(v)}">${esc(v)}</button>`).join('')}</div>` : ''}
+    ${aiReady() ? (R.busy ? `<div class="pf-pending" style="margin:0"><span class="dots"><i></i><i></i><i></i></span> Gemini is thinking of lines…</div>`
+      : `${(R.sugs || []).length ? `<div class="rx-sugs ai" aria-label="Suggested lines">${R.sugs.map((v) => `<button class="rx-sug" data-act="pf-rx-sug" data-text="${esc(v)}">${esc(v)}</button>`).join('')}</div>` : ''}
+        <button class="link spark" data-act="pf-rx-ai">${icon('spark')} ${(R.sugs || []).length ? 'More lines' : 'Suggest lines'}</button>`) : ''}
     <div class="rx-foot"><span class="field-label">Toward ${esc(mc.name)}</span><div class="seg sm" role="group" aria-label="Relationship change">${[[-1, '↓ Worse'], [0, 'Same'], [1, '↑ Better']].map(([v, l]) => `<button type="button" aria-pressed="${(R.rel || 0) === v}" data-act="pf-rx-rel" data-v="${v}">${l}</button>`).join('')}</div></div>
-    <div class="row"><button class="btn btn-accent sm" data-act="pf-rx-add">${icon('plus')} Add reaction</button><button class="btn btn-ghost sm" data-act="pf-rx-cancel">Cancel</button></div>
+    <div class="row"><button class="btn btn-accent sm" data-act="pf-rx-add">${R.editId ? `${icon('edit')} Save reaction` : `${icon('plus')} Add reaction`}</button><button class="btn btn-ghost sm" data-act="pf-rx-cancel">Cancel</button></div>
   </div>`;
 }
 function paintEngine(nid, focusReply) {
@@ -1417,6 +1435,7 @@ function pfAdd() {
     item = { id: newId(), kind: 'move', author: eng.mc, an: charInfo(n, eng.mc, eng.mcName).name, mode: S.pfMode === 'say' ? 'say' : 'do', text, ts: now };
   }
   item.reactions = []; item.ch = null;
+  if (eng.scene.text) item.scene = eng.scene.text;
   const wasCrisis = !!eng.crisis && item.kind === 'move';
   if (wasCrisis) item.climax = true;
   const before = eng.tension;
@@ -1426,11 +1445,13 @@ function pfAdd() {
   checkCrisis(n, eng, wasCrisis);
   trimEngine(eng);
   S.pfT = 0; S.pfDraft = null;
-  S.pfReply = { postId: item.id, author: null, text: '', rel: 0 };
+  const partner = aiReady() && S.ai.partner;
+  S.pfReply = partner ? null : { postId: item.id, author: null, text: '', rel: 0 };
   saveEngine(n.id, 300);
   paintComposer(n, eng);
   $('#pf-input').value = ''; pfCount();
   paintEngine(n.id);
+  if (partner) pfPartner(n, eng, item);
 }
 function pfRxAdd() {
   const n = curNovel(), eng = n && S.engines.get(n.id), R = S.pfReply;
@@ -1439,13 +1460,12 @@ function pfRxAdd() {
   const text = (box ? box.value : R.text || '').trim().slice(0, 400);
   if (!text) { box?.focus(); return; }
   const p = eng.posts.find((x) => x.id === R.postId); if (!p) return;
-  const item = { id: newId(), author: R.author, an: charInfo(n, R.author).name, text };
-  p.reactions.push(item); fresh.add(item.id);
-  if (R.rel) {
-    const from = eng.rel[R.author] || 0, to = clamp(from + R.rel, -3, 3);
-    if (to !== from) { eng.rel[R.author] = to; p.delta = p.delta || {}; (p.delta.rel = p.delta.rel || []).push({ id: R.author, an: item.an, from, to }); }
-  }
-  S.pfReply = { postId: p.id, author: null, text: '', rel: 0 };
+  const old = R.editId && p.reactions.find((r) => r.id === R.editId);
+  const item = old || { id: newId(), author: R.author, an: charInfo(n, R.author).name, text };
+  if (old) { old.text = text; delete old.ai; } // once you've edited it, it's your line
+  else { p.reactions.push(item); fresh.add(item.id); }
+  if (R.rel) applyRel(eng, p, R.author, item.an, R.rel);
+  S.pfReply = old ? null : { postId: p.id, author: null, text: '', rel: 0 };
   saveEngine(n.id, 300);
   paintEngine(n.id);
 }
@@ -1485,9 +1505,18 @@ function pfThreadsSheet() {
 }
 function pfMenu() {
   const n = curNovel(); if (!n || !S.engines.get(n.id)) return;
+  const seg = (act, cur, opts) => `<div class="seg">${opts.map(([v, l]) => `<button aria-pressed="${String(cur) === String(v)}" data-act="${act}" data-v="${v}">${l}</button>`).join('')}</div>`;
   openSheet(`
     <div class="sheet-head"><h3>Plotfeed</h3>${closeBtn}</div>
+    ${aiReady() ? `<div class="form" style="margin-bottom:6px">
+      <div class="field"><span class="field-label">${icon('spark')} AI partner</span>${seg('pf-partner', S.ai.partner ? 'on' : 'off', [['on', 'On'], ['off', 'Off']])}
+        <span class="hint">When it’s on, the cast replies after each post and the co-author suggests what could happen next. You can still ask with “Cast replies” when it’s off.</span></div>
+      <div class="field"><span class="field-label">Replies per turn</span>${seg('pf-replies', S.ai.replies || 2, [[1, '1'], [2, '2'], [3, '3']])}
+        <span class="hint">Plus anyone you speak to by name.</span></div>
+    </div>` : ''}
     <div class="menu">
+      ${aiReady() ? '' : `<button class="menu-item" data-act="settings">${icon('spark')}<span>Set up the AI partner (Gemini)</span></button>`}
+      <button class="menu-item" data-act="pf-scene">${icon('signpost')}<span>Set the scene</span></button>
       <button class="menu-item" data-act="pf-mc-change">${icon('users')}<span>Change who you play</span></button>
       <button class="menu-item" data-act="pf-copy">${icon('copy')}<span>Copy the feed as text</span></button>
       <button class="menu-item danger" data-act="pf-reset-ask">${icon('trash')}<span>Reset Plotfeed</span></button>
@@ -1550,6 +1579,7 @@ async function pfOutlineMake() {
   const snap = picked.map((p) => ({
     kind: p.kind, mode: p.mode || null, who: p.kind === 'event' ? 'The world' : charInfo(n, p.author, p.an).name, text: p.text,
     reactions: (p.reactions || []).map((r) => ({ who: charInfo(n, r.author, r.an).name, text: r.text })), done: false,
+    scene: p.scene || '',
   }));
   let ch;
   if (c.dest === 'append' && m.get(c.lastId)) {
@@ -1580,8 +1610,11 @@ function outlineBarHTML(ch) {
   const done = ol.filter((b) => b.done).length;
   return `<button class="ol-bar" data-act="ed-outline">${icon('recap')}<span class="ol-bar-t">Outline</span><span class="ol-bar-n">${done}/${ol.length} beats written</span>${icon('chev', 'chev')}</button>`;
 }
+// The scene line shows wherever the scene changes between beats.
+const sceneAt = (ol, i) => (ol[i].scene && (i === 0 || ol[i - 1].scene !== ol[i].scene) ? ol[i].scene : '');
 function outlineText(ch) {
-  return (ch.outline || []).map((b, i) => `${i + 1}. ${b.kind === 'move' ? `${b.who} ${b.mode === 'say' ? 'says' : 'does'}` : b.who}: ${b.text}` + b.reactions.map((r) => `\n   - ${r.who}: ${r.text}`).join('')).join('\n');
+  const ol = ch.outline || [];
+  return ol.map((b, i) => (sceneAt(ol, i) ? `Scene: ${sceneAt(ol, i)}\n` : '') + `${i + 1}. ${b.kind === 'move' ? `${b.who} ${b.mode === 'say' ? 'says' : 'does'}` : b.who}: ${b.text}` + b.reactions.map((r) => `\n   - ${r.who}: ${r.text}`).join('')).join('\n');
 }
 function outlineSheet() {
   const ch = curChapter(); if (!ch || !(ch.outline || []).length) return;
@@ -1589,10 +1622,12 @@ function outlineSheet() {
     <div class="sheet-head"><span class="sheet-ic">${icon('recap')}</span><h3>Chapter ${esc(ch.n)} outline</h3>${closeBtn}</div>
     <p class="sheet-sub">Beats from Plotfeed, in order. Tick each one off once it’s written.</p>
     <ol class="ol-list">${ch.outline.map((b, i) => `<li>
+      ${sceneAt(ch.outline, i) ? `<p class="ol-scene">${icon('signpost')} ${esc(sceneAt(ch.outline, i))}</p>` : ''}
       <button class="beat-row" aria-pressed="${!!b.done}" data-act="ol-done" data-i="${i}"><span class="beat-box" aria-hidden="true"></span><span class="beat-txt"><b>${esc(b.who)}</b>${b.kind === 'move' ? ` ${b.mode === 'say' ? 'says' : 'does'}` : ''}: ${esc(b.text)}</span></button>
       ${b.reactions.length ? `<ul class="ol-rx">${b.reactions.map((r) => `<li><b>${esc(r.who)}:</b> ${esc(r.text)}</li>`).join('')}</ul>` : ''}
     </li>`).join('')}</ol>
     <div class="menu" style="margin-top:12px">
+      ${aiReady() ? `<button class="menu-item" data-act="ed-draft">${icon('spark')}<span>Draft this chapter with Gemini</span></button>` : ''}
       <button class="menu-item" data-act="ol-copy">${icon('copy')}<span>Copy the outline</span></button>
       <button class="menu-item danger" data-act="ol-clear">${icon('trash')}<span>Remove the outline from this chapter</span></button>
     </div>`, 'Chapter outline');
@@ -1657,6 +1692,450 @@ function createFromWorld(id) {
 }
 
 /* =========================================================
+   Gemini: the AI partner (your own API key, stored on this device only)
+   ========================================================= */
+const GEMINI = 'https://generativelanguage.googleapis.com/v1beta';
+const aiReady = () => !!(S.ai.key && S.ai.model);
+const saveAi = () => exec((st) => st.saveMeta('ai', clone(S.ai)));
+const aiErr = (code) => Object.assign(new Error(code), { code });
+const AI_MSG = {
+  offline: 'The AI partner needs internet. Your writing is saved; try again when you’re online.',
+  key: 'Gemini didn’t accept the API key. Check it in Backup and settings.',
+  quota: 'Gemini’s limit for your key is used up for now. Try again later.',
+  model: 'That Gemini model isn’t available. Pick another in Backup and settings.',
+  blocked: 'Gemini declined to write this one. Try rewording, or write it yourself.',
+  timeout: 'Gemini took too long to answer. Try again.',
+  format: 'Gemini’s answer came back garbled. Try again.',
+  server: 'Gemini had a problem. Try again in a moment.',
+  nokey: 'Add your Gemini API key in Backup and settings first.',
+};
+const aiMsg = (e) => AI_MSG[e && e.code] || AI_MSG.server;
+
+async function gemini(prompt, { schema, system, signal, temperature = 0.9 } = {}) {
+  if (!aiReady()) throw aiErr('nokey');
+  if (navigator.onLine === false) throw aiErr('offline');
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort('timeout'), 60000);
+  const onCancel = () => ctl.abort('cancel');
+  if (signal) { if (signal.aborted) onCancel(); else signal.addEventListener('abort', onCancel); }
+  const cfg = { temperature };
+  if (schema) { cfg.responseMimeType = 'application/json'; cfg.responseSchema = schema; }
+  const body = { contents: [{ role: 'user', parts: [{ text: prompt }] }], generationConfig: cfg };
+  if (system) body.systemInstruction = { parts: [{ text: system }] };
+  let res, data;
+  try {
+    res = await fetch(`${GEMINI}/${S.ai.model}:generateContent`, {
+      method: 'POST', signal: ctl.signal,
+      headers: { 'content-type': 'application/json', 'x-goog-api-key': S.ai.key },
+      body: JSON.stringify(body),
+    });
+    data = await res.json().catch(() => null);
+  } catch (e) {
+    throw aiErr(ctl.signal.aborted ? (ctl.signal.reason === 'cancel' ? 'cancel' : 'timeout') : 'offline');
+  } finally {
+    clearTimeout(timer);
+    if (signal) signal.removeEventListener('abort', onCancel);
+  }
+  if (!res.ok) {
+    const msg = String(data && data.error && data.error.message || '');
+    if (res.status === 429) throw aiErr('quota');
+    if (res.status === 403 || /api key/i.test(msg)) throw aiErr('key');
+    if (res.status === 404) throw aiErr('model');
+    throw aiErr('server');
+  }
+  const cand = data && data.candidates && data.candidates[0];
+  const text = cand && cand.content && Array.isArray(cand.content.parts) ? cand.content.parts.map((p) => p.text || '').join('') : '';
+  if (!text.trim()) throw aiErr(data && data.promptFeedback && data.promptFeedback.blockReason || (cand && /SAFETY|PROHIBITED|BLOCK/.test(cand.finishReason || '')) ? 'blocked' : 'format');
+  if (!schema) return text.trim();
+  try { return JSON.parse(text.replace(/^\s*```(?:json)?\s*|\s*```\s*$/g, '')); } catch (e) { throw aiErr('format'); }
+}
+// Lists the Gemini models this key can use to write text.
+async function geminiModels(key) {
+  let res, data;
+  try {
+    res = await fetch(`${GEMINI}/models?pageSize=200`, { headers: { 'x-goog-api-key': key } });
+    data = await res.json().catch(() => null);
+  } catch (e) { throw aiErr('offline'); }
+  if (!res.ok) throw aiErr(res.status === 429 ? 'quota' : res.status === 400 || res.status === 403 ? 'key' : 'server');
+  return ((data && data.models) || [])
+    .filter((m) => /^models\/gemini/.test(m.name || '') && (m.supportedGenerationMethods || []).includes('generateContent') && !/embed|image|tts|audio|live|vision/i.test(m.name))
+    .map((m) => ({ name: m.name, label: m.displayName || m.name.replace(/^models\//, '') }));
+}
+// Prefer the newest stable "flash" model: fast, and cheap on the free tier.
+function pickModel(models, current) {
+  if (models.some((m) => m.name === current)) return current;
+  const ver = (s) => (String(s).match(/(\d+(?:\.\d+)?)/) || [0, 0])[1] * 1;
+  const rank = (m) => (/flash/i.test(m.name) ? 2 : 0) + (/lite|exp|preview|thinking|latest/i.test(m.name) ? -1 : 0);
+  const sorted = models.slice().sort((a, b) => rank(b) - rank(a) || ver(b.name) - ver(a.name));
+  return sorted[0] ? sorted[0].name : '';
+}
+
+/* ---- the story context sent with each request ---- */
+const lang = (n) => (n.language || 'English').trim();
+function novelContext(n, eng) {
+  const L = [`NOVEL: "${n.title}"`];
+  const f = [['Genre', n.genre], ['Language', lang(n)], ['Point of view', n.pov], ['Tense', n.tense], ['Style', n.style]].filter((x) => x[1]).map((x) => `${x[0]}: ${x[1]}`);
+  if (f.length) L.push(f.join(' · '));
+  if (n.premise) L.push(`Premise: ${trunc(n.premise, 700)}`);
+  if (n.synopsis) L.push(`Synopsis: ${trunc(n.synopsis, 700)}`);
+  const chars = n.characters || [];
+  if (chars.length) {
+    L.push('', 'CHARACTERS:');
+    chars.forEach((c) => {
+      const bits = [`- [${c.id}] ${c.name}${c.role ? ` (${c.role})` : ''}`];
+      if (eng && c.id === eng.mc) bits.push('MAIN CHARACTER, played by the writer');
+      else if (eng) bits.push(`feels "${relLabel(eng.rel[c.id] || 0)}" toward ${charInfo(n, eng.mc, eng.mcName).name}`);
+      if (c.note) bits.push(trunc(c.note, 320));
+      if (Array.isArray(c.voice) && c.voice.length) bits.push(`Voice: ${c.voice.slice(0, 4).map((v) => `"${v}"`).join(' ')}`);
+      L.push(bits.join(' — '));
+    });
+  }
+  const world = (n.world || []).slice(0, 12);
+  if (world.length) { L.push('', 'WORLD NOTES:'); world.forEach((w) => L.push(`- ${w.name}: ${trunc(w.note || '', 220)}`)); }
+  return L.join('\n');
+}
+function feedContext(n, eng, upto) {
+  const L = [];
+  if (eng.scene.text || eng.scene.present.length) {
+    const who = eng.scene.present.map((id) => charInfo(n, id)).filter((c) => !c.gone).map((c) => c.name);
+    L.push(`SCENE: ${eng.scene.text || '(not described)'}${who.length ? ` · Present: ${who.join(', ')}` : ''}`);
+  }
+  L.push(`TENSION: ${eng.tension}/100${eng.crisis ? ' (CRISIS: the next move of the main character is the climax of this arc)' : ''}`);
+  const open = eng.threads.filter((t) => t.open);
+  if (open.length) { L.push('OPEN THREADS:'); open.slice(-12).forEach((t) => L.push(`- [${t.id}] ${t.text}`)); }
+  const beats = eng.posts.filter(isBeat);
+  const i = upto ? beats.indexOf(upto) : -1;
+  const recent = beats.slice(i >= 0 ? i + 1 : 0, (i >= 0 ? i + 1 : 0) + 14).reverse();
+  if (recent.length) {
+    L.push('', 'STORY SO FAR IN PLOTFEED (oldest first):');
+    recent.forEach((p) => { L.push(beatLabel(n, p)); (p.reactions || []).forEach((r) => L.push(`  ${charInfo(n, r.author, r.an).name}: ${r.text}`)); });
+  }
+  return L.join('\n');
+}
+// Characters the writer spoke to by name or @handle, in the order they were named.
+function namedIn(n, eng, text) {
+  const hits = [];
+  castOf(n, eng).forEach((c) => {
+    const i = charInfo(n, c.id);
+    const first = i.name.replace(/^(the|a|an)\s+/i, '').split(/\s+/)[0] || '';
+    const keys = [i.name, first, '@' + i.handle].filter((k) => k.replace(/^@/, '').length >= 2);
+    let at = -1;
+    keys.forEach((k) => {
+      const esc2 = k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      let m = null;
+      try { m = new RegExp(`(^|[^\\p{L}\\p{N}_])${esc2}(?=$|[^\\p{L}\\p{N}_])`, 'iu').exec(text); } catch (e) { m = null; }
+      if (m && (at < 0 || m.index < at)) at = m.index;
+    });
+    if (at >= 0) hits.push([at, c.id]);
+  });
+  return hits.sort((a, b) => a[0] - b[0]).map((h) => h[1]);
+}
+
+/* ---- a partner turn: the cast replies, the co-author suggests ---- */
+const PARTNER_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    replies: { type: 'ARRAY', items: { type: 'OBJECT', properties: { charId: { type: 'STRING' }, text: { type: 'STRING' }, rel: { type: 'INTEGER' } }, required: ['charId', 'text'] } },
+    tension: { type: 'INTEGER' },
+    event: { type: 'STRING' },
+    scene: { type: 'STRING' },
+    newThread: { type: 'STRING' },
+    resolveThreadIds: { type: 'ARRAY', items: { type: 'STRING' } },
+    nextMoves: { type: 'ARRAY', items: { type: 'OBJECT', properties: { mode: { type: 'STRING', enum: ['do', 'say'] }, text: { type: 'STRING' } }, required: ['mode', 'text'] } },
+  },
+  required: ['replies', 'nextMoves'],
+};
+const partnerRuns = new Map(); // novel id -> AbortController of the turn in progress
+function partnerSystem(n, eng) {
+  const mc = charInfo(n, eng.mc, eng.mcName).name;
+  return `You are the co-author and the supporting cast of a serial web novel. The writer plays ${mc}, the main character.
+Rules:
+- Never write ${mc}'s words, thoughts or actions in replies. Only other characters reply.
+- Write every reply, suggestion and next move in ${lang(n)}.
+- Each character stays true to their notes, voice lines and current feelings toward ${mc}, and knows only what the story so far makes plausible.
+- A reply is what that character says, optionally with a short action, 1 to 3 sentences, like a line in a chat or a scene. No name prefix, no surrounding quotation marks.
+- Replies form one conversation in the given order: a later reply may answer an earlier one.
+- Keep the genre's tone. Keep suggestions concrete and short (one sentence each).`;
+}
+function partnerPrompt(n, eng, p, must, may) {
+  const names = (ids) => ids.map((id) => `${charInfo(n, id).name} [${id}]`).join(', ');
+  const max = must.length + (S.ai.replies || 2);
+  return `${novelContext(n, eng)}
+
+${feedContext(n, eng, p)}
+
+NEW BEAT (reply to this): ${beatLabel(n, p)}
+
+WHO REPLIES
+${must.length ? `- MUST reply first, in this order: ${names(must)}` : '- Nobody was spoken to by name.'}
+${may.length ? `- MAY also reply (pick those who would naturally react): ${names(may)}` : ''}
+- At most ${max} replies in total. Use the exact charId in brackets.
+- For each reply, "rel" is how that character's feelings toward the main character shift because of this beat: -1 worse, 0 same, 1 better.
+
+AS CO-AUTHOR, ALSO SUGGEST
+- "tension": one of -10, 0, 5, 15 for how this beat changes the stakes.
+- "event": optionally one world event or twist that would raise the stakes now (leave empty if none fits).
+- "scene": only if the story naturally moves to a new place or time, one sentence describing it; otherwise empty.
+- "newThread": optionally one new open question this beat raises; otherwise empty.
+- "resolveThreadIds": ids of open threads this beat answers, if any.
+- "nextMoves": 2 or 3 different options for what the main character could say ("say") or do ("do") next, written as the move itself.`;
+}
+function pfPartner(n, eng, p, force) {
+  if (!aiReady() || (!S.ai.partner && !force) || !isBeat(p)) return;
+  const prev = partnerRuns.get(n.id); if (prev) prev.abort();
+  const ctl = new AbortController(); partnerRuns.set(n.id, ctl);
+  const castIds = castOf(n, eng).filter((c) => !charInfo(n, c.id).gone).map((c) => c.id);
+  const others = castIds.filter((id) => id !== p.author);
+  const must = p.kind === 'event' ? [] : namedIn(n, eng, p.text).filter((id) => others.includes(id));
+  const present = eng.scene.present.filter((id) => others.includes(id));
+  const may = (present.length ? present : others).filter((id) => !must.includes(id));
+  if (!must.length && !may.length) return;
+  S.pfErr.delete(p.id);
+  p.pending = true;
+  paintEngine(n.id);
+  gemini(partnerPrompt(n, eng, p, must, may), { schema: PARTNER_SCHEMA, system: partnerSystem(n, eng), signal: ctl.signal })
+    .then((res) => {
+      if (S.engines.get(n.id) !== eng || !eng.posts.includes(p)) return;
+      p.reactions = p.reactions.filter((r) => !r.ai);
+      const allowed = new Set([...must, ...may]);
+      const seen = new Set();
+      const replies = (Array.isArray(res.replies) ? res.replies : []).filter((r) => r && allowed.has(r.charId) && typeof r.text === 'string' && r.text.trim() && !seen.has(r.charId) && seen.add(r.charId)).slice(0, must.length + (S.ai.replies || 2));
+      const rel = [];
+      replies.forEach((r) => {
+        const item = { id: newId(), author: r.charId, an: charInfo(n, r.charId).name, text: r.text.trim().replace(/^["“]|["”]$/g, '').slice(0, 400), ai: true };
+        p.reactions.push(item); fresh.add(item.id);
+        const step = Math.sign(Number(r.rel) || 0);
+        const to = clamp((eng.rel[r.charId] || 0) + step, -3, 3);
+        if (step && to !== (eng.rel[r.charId] || 0)) rel.push({ id: r.charId, step });
+      });
+      const T = [-10, 0, 5, 15];
+      const t = T.reduce((a, v) => (Math.abs(v - Number(res.tension)) < Math.abs(a - Number(res.tension)) ? v : a), 0);
+      const str = (v, max) => (typeof v === 'string' && v.trim() ? v.trim().slice(0, max) : '');
+      const openIds = new Set(eng.threads.filter((x) => x.open).map((x) => x.id));
+      const card = {
+        rel, tension: Number.isFinite(Number(res.tension)) ? t : 0,
+        event: str(res.event, 300), scene: str(res.scene, 200), thread: str(res.newThread, 160),
+        resolve: (Array.isArray(res.resolveThreadIds) ? res.resolveThreadIds : []).filter((id) => openIds.has(id)),
+        bring: eng.scene.present.length ? must.filter((id) => !eng.scene.present.includes(id)) : [],
+        moves: (Array.isArray(res.nextMoves) ? res.nextMoves : []).filter((m) => m && typeof m.text === 'string' && m.text.trim()).slice(0, 3).map((m) => ({ mode: m.mode === 'say' ? 'say' : 'do', text: m.text.trim().slice(0, 600) })),
+      };
+      eng.posts.forEach((x) => { delete x.partner; }); // only the newest moment keeps its suggestions
+      if (cardSize(card)) p.partner = card;
+    })
+    .catch((e) => { if (e.code !== 'cancel') S.pfErr.set(p.id, aiMsg(e)); })
+    .finally(() => {
+      if (partnerRuns.get(n.id) === ctl) partnerRuns.delete(n.id);
+      delete p.pending;
+      saveEngine(n.id, 300);
+      paintEngine(n.id);
+    });
+}
+const cardSize = (c) => c ? c.rel.length + (c.tension ? 1 : 0) + (c.event ? 1 : 0) + (c.scene ? 1 : 0) + (c.thread ? 1 : 0) + c.resolve.length + c.bring.length + c.moves.length : 0;
+function pfCardHTML(n, eng, p) {
+  const c = p.partner; if (!cardSize(c)) return '';
+  const b = (k, i, cls, label) => `<button class="pf-sug ${cls}" data-act="pf-sug" data-id="${esc(p.id)}" data-k="${k}" data-i="${i}">${label}</button>`;
+  const sugs = [];
+  c.rel.forEach((r, i) => { const cur = eng.rel[r.id] || 0; sugs.push(b('rel', i, r.step > 0 ? 'rel-up' : 'rel-down', `${esc(charInfo(n, r.id).name)} ${r.step > 0 ? '↑' : '↓'} ${esc(relLabel(clamp(cur + r.step, -3, 3)))}?`)); });
+  if (c.tension) sugs.push(b('tension', 0, c.tension > 0 ? 'up' : 'down', `Tension ${c.tension > 0 ? '+' : '−'}${Math.abs(c.tension)}?`));
+  c.bring.forEach((id, i) => sugs.push(b('bring', i, '', `Bring ${esc(charInfo(n, id).name)} into the scene?`)));
+  c.resolve.forEach((id, i) => { const t = eng.threads.find((x) => x.id === id); if (t) sugs.push(b('resolve', i, 'down', `Resolved: ${esc(trunc(t.text, 60))}?`)); });
+  if (c.thread) sugs.push(b('thread', 0, 'thr', `New thread: ${esc(c.thread)}`));
+  if (c.scene) sugs.push(b('scene', 0, '', `${icon('signpost')} Move to: ${esc(c.scene)}`));
+  if (c.event) sugs.push(b('event', 0, 'ev', `${icon('globe')} Twist: ${esc(c.event)}`));
+  return `<div class="pf-card">
+    <div class="pf-card-head">${icon('spark')}<span>Co-author</span><span class="spacer"></span><button class="link" data-act="pf-sug-dismiss" data-id="${esc(p.id)}">Dismiss</button></div>
+    ${sugs.length ? `<div class="pf-sugs">${sugs.join('')}</div>` : ''}
+    ${c.moves.length ? `<span class="field-label">Your next move</span><div class="pf-moves">${c.moves.map((m, i) => `<button class="pf-move" data-act="pf-next" data-id="${esc(p.id)}" data-i="${i}"><span class="pf-kind">${m.mode === 'say' ? 'Says' : 'Does'}</span>${esc(m.text)}</button>`).join('')}</div>` : ''}
+  </div>`;
+}
+function applyRel(eng, p, id, an, step) {
+  const from = eng.rel[id] || 0, to = clamp(from + step, -3, 3);
+  if (to === from) return;
+  eng.rel[id] = to;
+  p.delta = p.delta || {};
+  (p.delta.rel = p.delta.rel || []).push({ id, an, from, to });
+}
+function pfSugApply(el) {
+  const n = curNovel(), eng = n && S.engines.get(n.id); if (!eng) return;
+  const p = eng.posts.find((x) => x.id === el.dataset.id), c = p && p.partner; if (!c) return;
+  const k = el.dataset.k, i = Number(el.dataset.i) || 0;
+  if (k === 'rel' && c.rel[i]) { const r = c.rel.splice(i, 1)[0]; applyRel(eng, p, r.id, charInfo(n, r.id).name, r.step); }
+  else if (k === 'tension' && c.tension) {
+    const before = eng.tension;
+    eng.tension = clamp(eng.tension + c.tension, 0, 100);
+    p.delta = p.delta || {}; p.delta.t = (p.delta.t || 0) + (eng.tension - before);
+    if (!p.delta.t) delete p.delta.t;
+    c.tension = 0;
+    if (eng.crisis && eng.tension < 100) eng.crisis = false;
+    checkCrisis(n, eng, false);
+  } else if (k === 'bring' && c.bring[i]) { const id = c.bring.splice(i, 1)[0]; if (!eng.scene.present.includes(id)) eng.scene.present.push(id); }
+  else if (k === 'resolve' && c.resolve[i]) {
+    const t = eng.threads.find((x) => x.id === c.resolve.splice(i, 1)[0]);
+    if (t && t.open) { t.open = false; p.delta = p.delta || {}; (p.delta.res = p.delta.res || []).push(t.text); }
+  } else if (k === 'thread' && c.thread) {
+    eng.threads.push({ id: newId(), text: c.thread, open: true, ts: Date.now() });
+    p.delta = p.delta || {}; (p.delta.add = p.delta.add || []).push(c.thread);
+    c.thread = ''; trimEngine(eng);
+  } else if (k === 'scene' && c.scene) {
+    eng.scene.text = c.scene; c.scene = '';
+    eng.posts.unshift(sysItem('scene', `Scene: ${eng.scene.text}`)); fresh.add(eng.posts[0].id);
+  } else if (k === 'event' && c.event) {
+    const ev = { id: newId(), kind: 'event', text: c.event, ts: Date.now(), reactions: [], ch: null, scene: eng.scene.text };
+    c.event = '';
+    if (!cardSize(c)) delete p.partner;
+    eng.posts.unshift(ev); fresh.add(ev.id);
+    trimEngine(eng); saveEngine(n.id, 300); paintEngine(n.id);
+    pfPartner(n, eng, ev);
+    return;
+  }
+  if (!cardSize(c)) delete p.partner;
+  saveEngine(n.id, 300); paintEngine(n.id);
+}
+function pfNextMove(el) {
+  const n = curNovel(), eng = n && S.engines.get(n.id); if (!eng) return;
+  const p = eng.posts.find((x) => x.id === el.dataset.id), c = p && p.partner; if (!c) return;
+  const m = c.moves[Number(el.dataset.i) || 0]; if (!m) return;
+  c.moves = [];
+  if (!cardSize(c)) delete p.partner;
+  saveEngine(n.id, 300);
+  S.pfMode = m.mode;
+  paintComposer(n, eng);
+  paintEngine(n.id);
+  const inp = $('#pf-input'); if (!inp) return;
+  inp.value = m.text; pfCount();
+  inp.focus({ preventScroll: true });
+  inp.closest('.pf-composer')?.scrollIntoView({ block: 'center', behavior: reduced ? 'auto' : 'smooth' });
+}
+// Three lines the chosen character might say, for the manual reaction form.
+async function pfRxSuggest() {
+  const n = curNovel(), eng = n && S.engines.get(n.id), R = S.pfReply;
+  if (!eng || !R || !R.author || R.busy) return;
+  const p = eng.posts.find((x) => x.id === R.postId); if (!p) return;
+  const who = charInfo(n, R.author).name;
+  R.busy = true; paintEngine(n.id, true);
+  try {
+    const res = await gemini(`${novelContext(n, eng)}\n\n${feedContext(n, eng, p)}\n\nNEW BEAT: ${beatLabel(n, p)}\n\nWrite 3 different short replies ${who} [${R.author}] might give to this beat, each 1 to 2 sentences, in ${lang(n)}, true to ${who}'s voice.`,
+      { schema: { type: 'OBJECT', properties: { lines: { type: 'ARRAY', items: { type: 'STRING' } } }, required: ['lines'] }, system: partnerSystem(n, eng) });
+    if (S.pfReply !== R) return;
+    R.sugs = (res.lines || []).filter((x) => typeof x === 'string' && x.trim()).slice(0, 3).map((x) => x.trim().slice(0, 400));
+  } catch (e) { if (S.pfReply === R) toast(aiMsg(e)); }
+  finally { R.busy = false; if (S.pfReply === R) paintEngine(n.id, true); }
+}
+
+/* ---- scene: where the story is and who is there ---- */
+function pfSceneHTML(n, eng) {
+  const sc = eng.scene;
+  const who = sc.present.map((id) => charInfo(n, id)).filter((c) => !c.gone);
+  return `<button class="pf-scene" data-act="pf-scene">
+    ${icon('signpost')}
+    <span class="pf-scene-txt"><span class="field-label">Scene</span><span class="${sc.text ? '' : 'placeholder'}">${esc(sc.text || 'Where are you, and who’s here? Tap to set the scene.')}</span></span>
+    ${who.length ? `<span class="pf-scene-avs">${who.slice(0, 5).map((c) => avHTML(c, 22)).join('')}</span>` : ''}
+  </button>`;
+}
+function pfSceneSheet() {
+  const n = curNovel(), eng = n && S.engines.get(n.id); if (!n || !eng) return;
+  const cast = castOf(n, eng);
+  openSheet(`
+    <div class="sheet-head"><span class="sheet-ic">${icon('signpost')}</span><h3>Scene</h3>${closeBtn}</div>
+    <p class="sheet-sub">Where and when this part happens, and who’s there. Only characters in the scene reply on their own, plus anyone you speak to by name. Leave everyone unticked to let the whole cast reply.</p>
+    <div class="form">
+      <label class="field"><span>Place and situation</span><textarea id="scene-text" rows="3" maxlength="200" placeholder="e.g. Night market, the arcade stall. Rain is starting."></textarea></label>
+      <div class="field"><span class="field-label">Who’s here</span><div class="choices">${cast.map((c) => `<button class="choice" aria-pressed="${eng.scene.present.includes(c.id)}" data-act="pf-scene-who" data-id="${esc(c.id)}">${esc(c.name)}</button>`).join('') || '<span class="placeholder">Add characters to the story bible first.</span>'}</div></div>
+      <div class="row"><button class="btn btn-accent sm" data-act="pf-scene-save">Save scene</button></div>
+    </div>`, 'Scene');
+  $('#scene-text').value = eng.scene.text;
+  S.ctx = { tool: 'scene', present: eng.scene.present.slice() };
+}
+function pfSceneSave() {
+  const n = curNovel(), eng = n && S.engines.get(n.id), c = S.ctx; if (!eng || !c || c.tool !== 'scene') return;
+  const text = ($('#scene-text')?.value || '').trim().slice(0, 200);
+  const changed = text !== eng.scene.text;
+  eng.scene = { text, present: c.present.filter((id) => !charInfo(n, id).gone) };
+  if (changed && text) { eng.posts.unshift(sysItem('scene', `Scene: ${text}`)); fresh.add(eng.posts[0].id); trimEngine(eng); }
+  saveEngine(n.id, 300);
+  closeSheet(); paintEngine(n.id);
+}
+
+/* ---- AI helpers in the editor ---- */
+function aiSheet(title, sub) {
+  openSheet(`
+    <div class="sheet-head"><span class="sheet-ic">${icon('spark')}</span><h3>${esc(title)}</h3>${closeBtn}</div>
+    <p class="sheet-sub">${esc(sub)}</p>
+    <div id="ai-out"><div class="pf-pending"><span class="dots"><i></i><i></i><i></i></span> Gemini is writing…</div></div>`, title);
+  const ctx = { tool: 'ai', text: '' };
+  S.ctx = ctx;
+  return ctx;
+}
+function aiShow(ctx, text, actions) {
+  if (S.ctx !== ctx) return;
+  ctx.text = text;
+  $('#ai-out').innerHTML = `<textarea class="copy-box" id="ai-text"></textarea><div class="row" style="margin-top:12px">${actions}<button class="btn btn-ghost sm" data-act="ai-copy">${icon('copy')} Copy</button></div>`;
+  $('#ai-text').value = text;
+}
+function aiFail(ctx, e) { if (S.ctx === ctx) $('#ai-out').innerHTML = `<p class="note-bar" style="margin:0">${esc(aiMsg(e))}</p>`; }
+function prevRecaps(n, ch) {
+  const m = S.chapters.get(n.id); if (!m) return '';
+  const before = [...m.values()].filter((c) => c.n < ch.n).sort((a, b) => a.n - b.n).slice(-3);
+  return before.map((c) => `Chapter ${c.n}${c.title ? ` "${c.title}"` : ''}: ${c.recap || trunc((c.text || '').trim(), 400)}`).join('\n');
+}
+async function edDraft() {
+  const n = curNovel(), ch = curChapter(); if (!n || !ch || !(ch.outline || []).length) return;
+  const ctx = aiSheet(`Draft chapter ${ch.n}`, 'A first draft from the outline beats. Read it, then insert it at the end of the chapter or copy what you want. Inserted text doesn’t count toward today’s goal.');
+  const eng = S.engines.get(n.id);
+  const prev = prevRecaps(n, ch), tail = (ch.text || '').trim().slice(-1500);
+  try {
+    const text = await gemini(`${novelContext(n, eng)}
+
+${prev ? `EARLIER CHAPTERS:\n${prev}\n\n` : ''}CHAPTER ${ch.n}${ch.title ? ` "${ch.title}"` : ''} OUTLINE (beats in order; reactions are dialogue ideas):
+${outlineText(ch)}
+${tail ? `\nTHE CHAPTER SO FAR ENDS WITH:\n${tail}\n\nContinue from there without repeating it.` : ''}
+
+Write ${tail ? 'the rest of' : ''} chapter ${ch.n} as finished prose in ${lang(n)}, about ${fmt(Math.max(500, (n.target || 2000) - (ch.words || 0)))} words${n.pov ? `, ${n.pov}` : ''}${n.tense ? `, ${n.tense} tense` : ''}${n.style ? `, style: ${n.style}` : ''}. Cover the beats in order, turn the reactions into natural dialogue, and end on a hook. Output only the chapter text, no title or notes.`,
+    { system: `You are a skilled web-novel ghostwriter. Write in ${lang(n)}. Stay faithful to the characters and the outline.`, temperature: 0.8 });
+    aiShow(ctx, text, `<button class="btn btn-accent sm" data-act="ai-insert">${icon('plus')} Insert at end</button>`);
+  } catch (e) { aiFail(ctx, e); }
+}
+async function edPolish(sel) {
+  const n = curNovel(), ch = curChapter(); if (!n || !ch) return;
+  const part = (ch.text || '').slice(sel.s, sel.e);
+  if (!part.trim()) { toast('Select some text in the chapter first, then open the menu.'); return; }
+  const ctx = aiSheet('Polish selected text', 'Grammar, spelling and flow fixed, keeping your meaning and voice. Replace the selection with it, or copy it.');
+  ctx.sel = sel; ctx.cid = ch.id; ctx.orig = part;
+  try {
+    const text = await gemini(`Polish this passage from chapter ${ch.n} of "${n.title}". Fix grammar, spelling, punctuation and awkward flow. Keep the meaning, the voice, the language (${lang(n)})${n.pov ? `, the point of view (${n.pov})` : ''}${n.tense ? ` and the tense (${n.tense})` : ''}. Keep the paragraph breaks. Output only the polished passage.\n\nPASSAGE:\n${part}`,
+      { system: `You are a careful fiction editor working in ${lang(n)}.`, temperature: 0.3 });
+    aiShow(ctx, text, `<button class="btn btn-accent sm" data-act="ai-replace">${icon('rewrite')} Replace selection</button>`);
+  } catch (e) { aiFail(ctx, e); }
+}
+async function edSummary(btn) {
+  const n = curNovel(), ch = curChapter(), box = $('#ed-recap'); if (!n || !ch || !box) return;
+  if (!(ch.text || '').trim()) { toast('Write some of the chapter first.'); return; }
+  btn.disabled = true; const label = btn.innerHTML; btn.innerHTML = '<span class="dots"><i></i><i></i><i></i></span>';
+  try {
+    const text = await gemini(`Summarise chapter ${ch.n} of "${n.title}" in two or three sentences in ${lang(n)}, saying what happens and what changes. Output only the summary.\n\nCHAPTER TEXT:\n${trunc(ch.text, 24000)}`, { temperature: 0.3 });
+    if ($('#ed-recap') === box) { box.value = text.slice(0, 1200); box.focus(); }
+  } catch (e) { toast(aiMsg(e)); }
+  finally { btn.disabled = false; btn.innerHTML = label; }
+}
+function aiApply(kind) {
+  const ctx = S.ctx, n = curNovel(), ch = curChapter(); if (!ctx || ctx.tool !== 'ai' || !n || !ch) return;
+  const text = ($('#ai-text')?.value || ctx.text).trim(); if (!text) return;
+  if (kind === 'replace') {
+    if (ctx.cid !== ch.id || ch.text.slice(ctx.sel.s, ctx.sel.e) !== ctx.orig) { toast('The chapter changed since you selected that text. Copy the polished text instead.'); return; }
+    ch.text = ch.text.slice(0, ctx.sel.s) + text + ch.text.slice(ctx.sel.e);
+  } else {
+    ch.text = (ch.text || '').trim() ? ch.text.replace(/\s*$/, '\n\n') + text : text;
+  }
+  ch.words = countWords(ch.text); ch.updatedAt = Date.now();
+  if (S.typing && S.typing.chapterId === ch.id) S.typing.words = ch.words; // not typed, so not counted toward today
+  saveChapter(n.id, ch.id, 0); touchNovel(n.id, 300);
+  closeSheet();
+  const ta = $('#ed-text'); if (ta) ta.value = ch.text;
+  paintCounts();
+  toast(kind === 'replace' ? 'Selection replaced' : 'Draft added to the end of the chapter');
+}
+
+/* =========================================================
    Settings, backup and restore
    ========================================================= */
 function downloadFile(name, text, type) {
@@ -1687,8 +2166,40 @@ function settingsSheet() {
     <p class="hint" style="margin-top:12px">${last ? `Last backup ${esc(ago(last))}.` : 'No backup saved yet.'} A backup holds every novel, chapter, story bible and Plotfeed board. Keep it somewhere safe, like Google Drive.</p>
     <input type="file" id="bk-file" accept="application/json,.json" hidden>
     <div id="confirm-slot"></div>
+    ${aiSettingsHTML()}
     <p class="hint" style="margin-top:18px">Serialist ${APP_VERSION}</p>`, 'Backup and settings');
   $('#bk-file').addEventListener('change', onRestoreFile);
+  $('#ai-model')?.addEventListener('change', (e) => { S.ai.model = e.target.value; saveAi(); toast('Gemini model changed'); });
+  $('#ai-key')?.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); aiSaveKey(); } });
+}
+function aiSettingsHTML() {
+  const A2 = S.ai;
+  return `<section class="set-sec">
+    <span class="eyebrow">${icon('spark')} AI partner · Gemini</span>
+    ${A2.key ? `
+      <p class="hint">Your key is saved on this device (ending in ${esc(A2.key.slice(-4))}).</p>
+      <label class="field"><span>Model</span><select id="ai-model">${(A2.models.length ? A2.models : [{ name: A2.model, label: A2.model.replace(/^models\//, '') }]).map((m) => `<option value="${esc(m.name)}"${m.name === A2.model ? ' selected' : ''}>${esc(m.label)}</option>`).join('')}</select></label>
+      <div class="row"><button class="btn btn-ghost sm" data-act="ai-test">Test the key</button><button class="btn btn-ghost sm" data-act="ai-remove">Remove key</button></div>`
+    : `
+      <label class="field"><span>Gemini API key</span><input id="ai-key" type="password" autocomplete="off" spellcheck="false" placeholder="Paste the key from Google AI Studio"></label>
+      <div class="row"><button class="btn btn-accent sm" data-act="ai-save">Save and test key</button></div>`}
+    <p class="hint" id="ai-msg">Get a key at aistudio.google.com. It stays on this device and is never put in backup files. What you send to the partner goes to Google.</p>
+  </section>`;
+}
+async function aiSaveKey() {
+  const inp = $('#ai-key'), msg = $('#ai-msg'), key = (inp ? inp.value : S.ai.key).trim();
+  if (!key) { inp?.focus(); return; }
+  if (msg) msg.textContent = 'Checking the key with Google…';
+  try {
+    const models = await geminiModels(key);
+    if (!models.length) throw aiErr('model');
+    S.ai.key = key; S.ai.models = models; S.ai.model = pickModel(models, S.ai.model);
+    saveAi();
+    const top = $('#sheet').scrollTop; settingsSheet(); $('#sheet').scrollTop = top;
+    $('#ai-msg').textContent = `Gemini is ready, using ${(models.find((m) => m.name === S.ai.model) || {}).label || S.ai.model}. Open Plotfeed and post a move: the cast will reply.`;
+  } catch (e) {
+    const m = $('#ai-msg'); if (m) m.textContent = e.code === 'model' ? 'That key works, but it has no Gemini text models available.' : aiMsg(e);
+  }
 }
 async function buildBackup() {
   for (const id of [...S.novels.keys()]) { await ensureChapters(id); await ensureEngine(id); }
@@ -1853,6 +2364,20 @@ const A = {
   },
   'ed-delete-confirm': () => deleteChapter(),
   'ed-outline': () => outlineSheet(),
+  'ed-draft': () => edDraft(),
+  'ed-polish': () => edPolish(edSel),
+  'ed-summary': (el) => edSummary(el),
+  'ai-insert': () => aiApply('insert'),
+  'ai-replace': () => aiApply('replace'),
+  'ai-copy': () => { const t = $('#ai-text'); if (t) copyText(t.value, 'Copied'); },
+  'ai-save': () => aiSaveKey(),
+  'ai-test': () => aiSaveKey(),
+  'ai-remove': () => {
+    S.ai.key = ''; S.ai.model = ''; S.ai.models = [];
+    saveAi();
+    const top = $('#sheet').scrollTop; settingsSheet(); $('#sheet').scrollTop = top;
+    toast('Gemini key removed from this device');
+  },
   'ol-done': (el) => {
     const ch = curChapter(); const b = ch && ch.outline && ch.outline[Number(el.dataset.i)]; if (!b) return;
     b.done = !b.done; ch.updatedAt = Date.now();
@@ -1926,15 +2451,45 @@ const A = {
   },
   'pf-rx-who': (el) => {
     if (!S.pfReply) return;
-    S.pfReply.author = el.dataset.id || null; S.pfReply.rel = 0;
+    S.pfReply.author = el.dataset.id || null; S.pfReply.rel = 0; S.pfReply.sugs = null; S.pfReply.editId = null;
     if (!S.pfReply.author) S.pfReply.text = '';
     paintEngine(S.route.novelId, !!S.pfReply.author);
   },
   'pf-rx-sug': (el) => {
     const n = curNovel(), R = S.pfReply; if (!n || !R || !R.author) return;
-    const line = charInfo(n, R.author).voice[Number(el.dataset.k)]; if (!line) return;
+    const line = el.dataset.text; if (!line) return;
     R.text = line; paintEngine(n.id, true);
   },
+  'pf-rx-ai': () => pfRxSuggest(),
+  'pf-rx-edit': (el) => {
+    const n = curNovel(), eng = n && S.engines.get(n.id); if (!eng) return;
+    const p = eng.posts.find((x) => x.id === el.dataset.id), r = p && p.reactions.find((x) => x.id === el.dataset.rid); if (!r) return;
+    S.pfReply = { postId: p.id, author: r.author, text: r.text, rel: 0, editId: r.id };
+    paintEngine(n.id, true);
+  },
+  'pf-redo': (el) => {
+    const n = curNovel(), eng = n && S.engines.get(n.id); if (!eng) return;
+    const p = eng.posts.find((x) => x.id === el.dataset.id); if (!p) return;
+    if (S.pfReply && S.pfReply.postId === p.id) S.pfReply = null;
+    pfPartner(n, eng, p, true);
+  },
+  'pf-sug': (el) => pfSugApply(el),
+  'pf-next': (el) => pfNextMove(el),
+  'pf-sug-dismiss': (el) => {
+    const n = curNovel(), eng = n && S.engines.get(n.id); if (!eng) return;
+    const p = eng.posts.find((x) => x.id === el.dataset.id); if (!p) return;
+    delete p.partner; saveEngine(n.id, 300); paintEngine(n.id);
+  },
+  'pf-scene': () => pfSceneSheet(),
+  'pf-scene-who': (el) => {
+    const c = S.ctx; if (!c || c.tool !== 'scene') return;
+    const id = el.dataset.id, i = c.present.indexOf(id);
+    if (i >= 0) c.present.splice(i, 1); else c.present.push(id);
+    el.setAttribute('aria-pressed', String(i < 0));
+  },
+  'pf-scene-save': () => pfSceneSave(),
+  'pf-partner': (el) => { S.ai.partner = el.dataset.v === 'on'; saveAi(); pfMenu(); },
+  'pf-replies': (el) => { S.ai.replies = clamp(Number(el.dataset.v) || 2, 1, 3); saveAi(); pfMenu(); },
   'pf-rx-rel': (el) => { if (!S.pfReply) return; S.pfReply.rel = Number(el.dataset.v) || 0; $$('[data-act="pf-rx-rel"]').forEach((b) => b.setAttribute('aria-pressed', String(Number(b.dataset.v) === S.pfReply.rel))); },
   'pf-rx-add': () => pfRxAdd(),
   'pf-rx-cancel': () => { S.pfReply = null; paintEngine(S.route.novelId); },
@@ -2067,6 +2622,7 @@ async function boot() {
   try { await loadFrom(store); }
   catch (e) { LocalStore.load(); store = LocalStore; S.mode = LocalStore.ok ? 'local' : 'memory'; await loadFrom(store); }
   S.store = store;
+  try { const ai = await store.getMeta('ai'); if (ai && typeof ai === 'object') Object.assign(S.ai, ai); } catch (e) {}
   if (S.firstRun) await seedStore();
   renderAll();
   askPersist();

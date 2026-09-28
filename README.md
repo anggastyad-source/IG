@@ -77,18 +77,34 @@ After that, open Serialist from its icon. It works without internet.
 | `Rendering` | The shelf, novel page, chapter list, story bible and editor. |
 | `Forms` | New novel, novel details, characters, world notes, word goal. |
 | `Plotfeed: the plotting board` | The feed, reactions, tension, threads and chapter outlines. |
+| `Gemini: the AI partner` | Your Gemini key, the Plotfeed partner and scene, and the editor's draft, polish and summary helpers. |
 | `Settings, backup and restore` | Backup files, restore, and the install card. |
 | `Actions` | Every button's `data-act` name and what it runs. |
 | `Boot` | Opening storage, the first-run examples, and the offline worker. |
 
 To add a button: give it `data-act="my-action"` in the HTML, then add `'my-action': (el) => { ... }` to the `A` object in the **Actions** section.
 
-## Adding Gemini later
+## The AI partner (Gemini)
 
-Your Google AI Plus subscription covers Google's own apps, not this one. Gemini inside your own app uses the **Gemini API**, which is billed separately. You create an API key in Google AI Studio, where you can also see the current pricing and free limits.
+Plotfeed can act as your writing partner. You play the main character. After you post, the other characters reply in their own voices, based on everything in the feed so far. A **Co-author** card then suggests relationship and tension changes, twists, scene changes, new threads and options for your next move. Nothing is applied until you tap it.
 
-- **Just for you:** add a field in Settings where you paste your key. It's saved on your phone only. Then call the Gemini API from `app.js`, for example to suggest the cast's reactions in Plotfeed, or to draft a chapter from its outline.
-- **For other people too:** don't put a key inside the app, because anyone could copy it. Put a small server between the app and Gemini instead.
+**Set it up once on each device:**
+
+1. Go to **aistudio.google.com**, sign in, and create an API key. Your Google AI Plus subscription doesn't cover this. The API has its own free tier and limits, which you can check in AI Studio.
+2. In Serialist, tap the **sliders button**, paste the key under **AI partner · Gemini**, and tap **Save and test key**.
+
+The key is saved only on that device. It's never put in backup files. Whatever you send to the partner goes to Google.
+
+**Using it:**
+
+- **Scene** (at the top of Plotfeed) sets where you are and who's there.
+  - Only characters in the scene reply on their own.
+  - Anyone you speak to by name, for example "so Cass, what do you think?", replies first, even if they aren't in the scene.
+- On any reply, **✎** edits it and **×** removes it. **Redo replies** asks again. **Cast replies** asks for replies to an older post.
+- The **⋯** menu in Plotfeed turns the partner on or off and sets how many characters reply each turn.
+- In the chapter editor, the outline sheet has **Draft this chapter with Gemini**. The chapter menu has **Polish selected text** and **Write it with Gemini** for the summary. Text Gemini writes doesn't count toward your daily word goal.
+
+In `app.js`, search for `Gemini: the AI partner`.
 
 ## Later: an Android APK file
 
